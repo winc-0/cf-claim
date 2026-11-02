@@ -5,11 +5,15 @@
     python cf_server.py --local     只允许本机访问
 
 领取在服务所在的电脑上运行，手机只负责查看和操作。
+装了 Tailscale 时，手机在任何网络下都能通过私有地址连回这台电脑。
 """
 
 import argparse
+import base64
 import csv
 import hmac
+import io
+import ipaddress
 import json
 import logging
 import secrets
@@ -20,7 +24,7 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import cf_claim
 
@@ -68,6 +72,53 @@ def lan_ip():
             return "127.0.0.1"
 
 
+def tailscale_ip():
+    """Tailscale 给每台设备分配 100.64.0.0/10 内的地址，有这个地址就说明已经连上。"""
+    network = ipaddress.ip_network("100.64.0.0/10")
+    try:
+        addresses = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except OSError:
+        return None
+    for info in addresses:
+        if ipaddress.ip_address(info[4][0]) in network:
+            return info[4][0]
+    return None
+
+
+def access_urls(port, token):
+    """手机可用的链接，能在任何网络使用的排在前面。"""
+    urls = []
+    remote = tailscale_ip()
+    if remote:
+        urls.append({"label": "任何网络（Tailscale）", "url": f"http://{remote}:{port}/?token={token}"})
+    urls.append({"label": "同一个 Wi-Fi", "url": f"http://{lan_ip()}:{port}/?token={token}"})
+    return urls
+
+
+def decode_login_link(png):
+    """读出登录二维码里的链接，只接受腾讯自己的地址。读不出来时返回 None，扫码不受影响。"""
+    try:
+        import zxingcpp
+        from PIL import Image
+
+        results = zxingcpp.read_barcodes(Image.open(io.BytesIO(png)))
+    except Exception:
+        log.warning("读取二维码内容失败")
+        return None
+    for result in results:
+        parts = urlsplit(result.text)
+        host = parts.hostname or ""
+        if parts.scheme in ("http", "https") and (host == "qq.com" or host.endswith(".qq.com")):
+            return result.text
+    return None
+
+
+def qq_open_url(link):
+    """手机 QQ 的跳转地址。这不是公开接口，能否使用取决于 QQ 版本，属于试验功能。"""
+    encoded = base64.b64encode(link.encode("utf-8")).decode("ascii")
+    return f"mqqapi://forward/url?src_type=web&version=1&url_prefix={quote(encoded, safe='')}"
+
+
 class App:
     """保存任务状态和事件流。同一时间只运行一个任务，因为它们共用一份浏览器资料。"""
 
@@ -81,6 +132,8 @@ class App:
         self.job = None
         self.stop_flag = threading.Event()
         self.login_invalid = False
+        self.login_qr = None
+        self.login_link = None
         self.discovered = self._load_cache()
 
     def _load_cache(self):
@@ -151,14 +204,31 @@ class App:
 
         return "ok" if self._start("run", target) else "busy"
 
-    def start_login(self):
+    def start_login(self, window=False):
+        """默认在页面上扫码；window 表示在电脑上打开登录窗口，二维码取不到时备用。"""
+
+        def set_qr(png):
+            self.login_qr = png
+            self.login_link = decode_login_link(png)
+
         def target():
-            code = self.engine.cmd_login(
-                self.config, emit=self.publish, auto_close=True, should_stop=self.stop_flag.is_set,
-                timeout_seconds=LOGIN_TIMEOUT_SECONDS,
-            )
-            if code == 0:
-                self.login_invalid = False
+            try:
+                if window:
+                    code = self.engine.cmd_login(
+                        self.config, emit=self.publish, auto_close=True, should_stop=self.stop_flag.is_set,
+                        timeout_seconds=LOGIN_TIMEOUT_SECONDS,
+                    )
+                else:
+                    code = self.engine.cmd_qr_login(
+                        self.config, emit=self.publish, on_qr=set_qr, should_stop=self.stop_flag.is_set,
+                        timeout_seconds=LOGIN_TIMEOUT_SECONDS,
+                    )
+                if code == 0:
+                    self.login_invalid = False
+            finally:
+                # 二维码和链接都能登录账号，用完立刻清掉
+                self.login_qr = None
+                self.login_link = None
 
         return "ok" if self._start("login", target) else "busy"
 
@@ -180,7 +250,7 @@ class App:
         return [{"time": r[0], "activity": r[1], "item": r[2], "source": r[3]} for r in reversed(rows)]
 
 
-def make_handler(app, token, access_url):
+def make_handler(app, token, lan):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "cf-claim"
@@ -242,9 +312,21 @@ def make_handler(app, token, access_url):
             elif path == "/api/history":
                 self._json({"items": app.history()})
             elif path == "/api/access":
-                self._json({"url": access_url})
-            elif path == "/api/qr.svg" and access_url:
-                self._qr()
+                self._json({"urls": self._access_urls()})
+            elif path == "/api/qr.svg":
+                self._qr(parts)
+            elif path == "/api/login/qr.png":
+                qr = app.login_qr
+                if qr:
+                    self._send(HTTPStatus.OK, qr, "image/png")
+                else:
+                    self._send(HTTPStatus.NOT_FOUND, b"{}")
+            elif path == "/api/login/link":
+                link = app.login_link
+                if link:
+                    self._json({"qq": qq_open_url(link), "direct": link})
+                else:
+                    self._send(HTTPStatus.NOT_FOUND, b"{}")
             else:
                 self._send(HTTPStatus.NOT_FOUND, b"{}")
 
@@ -270,7 +352,7 @@ def make_handler(app, token, access_url):
                     return
                 self._result(app.start_run(urls, bool(data.get("dry_run")), bool(data.get("show"))))
             elif path == "/api/login":
-                self._result(app.start_login())
+                self._result(app.start_login(window=bool(data.get("window"))))
             elif path == "/api/refresh":
                 self._result(app.start_refresh())
             elif path == "/api/stop":
@@ -287,13 +369,21 @@ def make_handler(app, token, access_url):
             else:
                 self._json({"error": "invalid"}, HTTPStatus.BAD_REQUEST)
 
-        def _qr(self):
+        def _access_urls(self):
+            return access_urls(self.server.server_address[1], token) if lan else []
+
+        def _qr(self, parts):
             import io
 
             import segno
 
+            index = parse_qs(parts.query).get("i", ["0"])[0]
+            urls = self._access_urls()
+            if not index.isdigit() or int(index) >= len(urls):
+                self._send(HTTPStatus.NOT_FOUND, b"{}")
+                return
             out = io.BytesIO()
-            segno.make(access_url, error="m").save(out, kind="svg", scale=5, border=2, xmldecl=False)
+            segno.make(urls[int(index)]["url"], error="m").save(out, kind="svg", scale=5, border=2, xmldecl=False)
             self._send(HTTPStatus.OK, out.getvalue(), "image/svg+xml")
 
         def _stream(self, parts):
@@ -331,18 +421,15 @@ class Server(ThreadingHTTPServer):
 
 
 def create_server(lan=True, port=DEFAULT_PORT, app=None):
-    """返回 (服务, 本机链接, 手机链接)。手机链接在只允许本机访问时为 None。"""
+    """返回 (服务, 本机链接, 手机链接列表)。只允许本机访问时列表为空。"""
     token = load_token()
     app = app or App()
-    access_url = f"http://{lan_ip()}:{port}/?token={token}" if lan else None
     host = "0.0.0.0" if lan else "127.0.0.1"
-    server = Server((host, port), make_handler(app, token, access_url))
+    server = Server((host, port), make_handler(app, token, lan))
     server.app = app
     actual_port = server.server_address[1]
-    if lan and port == 0:
-        access_url = f"http://{lan_ip()}:{actual_port}/?token={token}"
-        server.RequestHandlerClass = make_handler(app, token, access_url)
-    return server, f"http://127.0.0.1:{actual_port}/?token={token}", access_url
+    urls = access_urls(actual_port, token) if lan else []
+    return server, f"http://127.0.0.1:{actual_port}/?token={token}", urls
 
 
 def main():
@@ -351,10 +438,10 @@ def main():
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
     cf_claim.setup_logging()
-    server, local_url, access_url = create_server(lan=not args.local, port=args.port)
+    server, local_url, urls = create_server(lan=not args.local, port=args.port)
     print(f"电脑浏览器打开: {local_url}")
-    if access_url:
-        print(f"手机（连同一个 Wi-Fi）打开: {access_url}")
+    for entry in urls:
+        print(f"手机（{entry['label']}）打开: {entry['url']}")
     print("链接里含访问口令，不要发给别人。按 Ctrl+C 退出。")
     try:
         server.serve_forever()

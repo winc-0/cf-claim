@@ -10,7 +10,7 @@ const LABEL_CLASS = {
 };
 const LABEL_TEXT = { "未开放或不满足条件": "未开放" };
 
-const view = { busy: null, login: false, loaded: false };
+const view = { busy: null, login: false, loaded: false, qrLogin: false };
 let run = freshRun();
 
 function freshRun() {
@@ -85,10 +85,39 @@ function renderControls() {
   $("btn-preview").disabled = busy || none;
   $("btn-login").disabled = busy;
   $("btn-refresh").disabled = busy;
+  $("btn-login-window").disabled = busy;
   $("btn-stop").hidden = !(view.busy === "run" || view.busy === "login");
+  $("btn-stop").textContent = view.busy === "login" ? "取消登录" : "停止";
+  $("login-panel").hidden = view.busy !== "login" || !view.qrLogin;
+  if (view.busy !== "login") {
+    view.qrLogin = false;
+    $("login-qr").hidden = true;
+    $("login-qr").removeAttribute("src");
+    $("login-status").textContent = "正在获取二维码…";
+    clearLoginLinks();
+  }
   const login = $("login-state");
   login.textContent = view.login ? "已保存登录" : "未登录";
   login.className = `pill ${view.login ? "ok" : "bad"}`;
+}
+
+function clearLoginLinks() {
+  $("login-links").hidden = true;
+  $("link-qq").removeAttribute("href");
+  $("link-direct").removeAttribute("href");
+}
+
+async function loadLoginLinks() {
+  try {
+    const { qq, direct } = await api("/api/login/link");
+    // 请求期间登录可能已经结束，这时不能再把链接放回页面
+    if (view.busy !== "login") return;
+    $("link-qq").href = qq;
+    $("link-direct").href = direct;
+    $("login-links").hidden = false;
+  } catch {
+    clearLoginLinks();
+  }
 }
 
 function resetRun(total, dryRun) {
@@ -169,6 +198,19 @@ function handleEvent(event) {
       else if (event.claimed > 0) run.finished = `领取完成，领到 ${event.claimed} 项`;
       else run.finished = "结束，本次没有领到道具";
       addFeed("结束", event.claimed > 0 ? "ok" : "", run.finished, event.ts);
+      break;
+    case "login_qr":
+      // 重放历史事件时可能收到旧二维码，只有正在登录才显示
+      if (view.busy === "login") {
+        view.qrLogin = true;
+        $("login-qr").src = `/api/login/qr.png?v=${event.seq}`;
+        $("login-qr").hidden = false;
+        $("login-status").textContent = "等待扫码";
+        loadLoginLinks();
+      }
+      break;
+    case "login_scanned":
+      if (view.busy === "login") $("login-status").textContent = "已扫描，请在手机上确认";
       break;
     case "activities_updated":
       loadActivities();
@@ -261,13 +303,19 @@ async function loadHistory() {
 }
 
 async function loadAccess() {
-  const { url } = await api("/api/access");
-  $("phone-on").hidden = !url;
-  $("phone-off").hidden = Boolean(url);
-  if (url) {
-    $("phone-qr").src = "/api/qr.svg";
-    $("phone-url").textContent = url;
-  }
+  const { urls } = await api("/api/access");
+  const list = $("phone-list");
+  list.replaceChildren();
+  urls.forEach((entry, index) => {
+    const box = el("div", "access");
+    const qr = el("img", "qr");
+    qr.src = `/api/qr.svg?i=${index}`;
+    qr.alt = `${entry.label}的二维码`;
+    box.append(el("h3", "", entry.label), qr, el("p", "url small", entry.url));
+    list.append(box);
+  });
+  $("phone-off").hidden = urls.length > 0;
+  $("phone-remote-hint").hidden = urls.length !== 1;
 }
 
 function setAll(checked) {
@@ -285,10 +333,12 @@ async function startRun(dryRun) {
 $("btn-run").addEventListener("click", () => startRun(false));
 $("btn-preview").addEventListener("click", () => startRun(true));
 $("btn-stop").addEventListener("click", () => post("/api/stop"));
-$("btn-login").addEventListener("click", () => {
-  $("login-hint").hidden = false;
-  post("/api/login");
+$("btn-login").addEventListener("click", async () => {
+  view.qrLogin = true;
+  if (!(await post("/api/login"))) view.qrLogin = false;
+  renderControls();
 });
+$("btn-login-window").addEventListener("click", () => post("/api/login", { window: true }));
 $("btn-refresh").addEventListener("click", () => post("/api/refresh"));
 $("btn-all").addEventListener("click", () => setAll(true));
 $("btn-none").addEventListener("click", () => setAll(false));

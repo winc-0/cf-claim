@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>按真实活动页结构模拟的弹窗和按钮</title>
+<style>.amsdialog_modal{position:fixed;top:0;left:0;width:100%;height:100%;background:#fff;z-index:9}</style>
+<script>
+  window.clicks = [];
+  window.confirmed = [];
+  function ams(text, next, cancel) {
+    const modal = document.createElement('div');
+    modal.className = 'amsdialog_modal';
+    modal.innerHTML = '<div class="amsdialog_content"><p class="body"></p><div class="amsdialog_footer"><a href="javascript:;" class="ok">确认</a>' + (cancel ? '<a href="javascript:;">取消</a>' : '') + '</div></div>';
+    modal.querySelector('.body').innerText = text;
+    modal.querySelector('.ok').onclick = () => { window.confirmed.push(text); modal.remove(); if (next) next(); };
+    document.body.append(modal);
+  }
+  function claim(name) {
+    window.clicks.push(name);
+    ams('请确认，您当前活动绑定的大区为： 河北一区', () => setTimeout(() => ams('恭喜您获得了礼包： ' + name), 300), true);
+  }
+  function question(name) {
+    window.clicks.push(name);
+    ams('您目前还不是大咖身份，无法享受返还，请确认是否继续', null, true);
+  }
+  function blank(name) {
+    window.clicks.push(name);
+    ams('');
+  }
+  var OUT = {user: {exchangeTab2GoldArm: (n) => window.clicks.push('BAD-exchange' + n), getForeverGift: () => window.clicks.push('BAD-choice')}};
+</script>
+<div><span>每日礼包</span> <a href="javascript:claim('道具一');">立即领取</a></div>
+<div><span>每周礼包</span> <a href="javascript:claim('道具二');">领奖</a></div>
+<div><span>AN94-暗金风暴（30天）</span> <a href="javascript:OUT.user.exchangeTab2GoldArm('1')">立即领取</a></div>
+<div>源武器自由选 选择心仪的武器，选择后点击领取 <a href="javascript:OUT.user.getForeverGift();">立即领取</a></div>
+<div id="q"></div>
+<script>
+  var mode = new URLSearchParams(location.search).get('mode');
+  var q = document.getElementById('q');
+  if (mode === 'question') q.innerHTML = `<a href="javascript:question('问');">领取奖励</a>`;
+  if (mode === 'blank') q.innerHTML = `<a href="javascript:blank('空');">领取奖励</a>`;
+  if (mode === 'blocked') {
+    q.innerHTML = '<div style="position:fixed;top:0;left:0;width:100%;height:100%;z-index:9"></div>';
+  }
+</script>

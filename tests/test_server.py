@@ -1,6 +1,8 @@
 """网页服务测试。用假引擎代替真实领取，不打开浏览器。"""
 
+import base64
 import http.client
+import io
 import json
 import sys
 import tempfile
@@ -8,10 +10,12 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+import segno  # noqa: E402
 
 import cf_claim  # noqa: E402
 import cf_server  # noqa: E402
@@ -30,6 +34,7 @@ class FakeEngine:
         self.release = threading.Event()
         self.release.set()
         self.code = 0
+        self.qr_png = b"\x89PNG-fake"
 
     def login_saved(self):
         return True
@@ -44,6 +49,13 @@ class FakeEngine:
 
     def cmd_login(self, config, emit=None, auto_close=False, should_stop=None, timeout_seconds=None):
         self.calls.append({"login": auto_close})
+        return 0
+
+    def cmd_qr_login(self, config, emit=None, on_qr=None, should_stop=None, timeout_seconds=None):
+        self.calls.append({"qr_login": True})
+        on_qr(self.qr_png)
+        emit("login_qr", version=1)
+        self.release.wait(5)
         return 0
 
     def fetch_activities(self, config):
@@ -204,6 +216,89 @@ class ServerTest(unittest.TestCase):
         self.request("POST", "/api/login", {})
         self.wait_idle()
         self.assertTrue(self.app.state()["login"])
+
+    def test_login_qr_needs_token_and_is_cleared(self):
+        self.engine.release.clear()
+        self.assertEqual(self.request("GET", "/api/login/qr.png")[0].status, 404)
+        self.assertEqual(self.request("POST", "/api/login", {})[0].status, 200)
+        deadline = time.time() + 5
+        while self.app.login_qr is None and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(self.request("GET", "/api/login/qr.png", auth=False)[0].status, 401)
+        response, body = self.request("GET", "/api/login/qr.png")
+        self.assertEqual((response.status, body), (200, b"\x89PNG-fake"))
+        self.assertEqual(response.getheader("Cache-Control"), "no-store")
+        self.engine.release.set()
+        self.wait_idle()
+        self.assertEqual(self.request("GET", "/api/login/qr.png")[0].status, 404)
+        self.assertEqual(self.engine.calls, [{"qr_login": True}])
+
+    @staticmethod
+    def qr_png(text):
+        out = io.BytesIO()
+        segno.make(text, error="m").save(out, kind="png", scale=8, border=4)
+        return out.getvalue()
+
+    def test_decode_login_link_only_accepts_qq(self):
+        decode = cf_server.decode_login_link
+        good = "http://txz.qq.com/p?k=abc&f=716027609"
+        self.assertEqual(decode(self.qr_png(good)), good)
+        for bad in ("https://qq.com.evil.example/p", "https://evilqq.com/p", "mqqapi://x", "javascript:alert(1)"):
+            self.assertIsNone(decode(self.qr_png(bad)), bad)
+        self.assertIsNone(decode(b"not an image"))
+
+    def test_qq_open_url_encodes_link(self):
+        url = cf_server.qq_open_url("http://txz.qq.com/p?k=abc+/=&f=1")
+        self.assertTrue(url.startswith("mqqapi://forward/url?"))
+        value = parse_qs(urlsplit(url).query)["url_prefix"][0]
+        self.assertEqual(base64.b64decode(value).decode(), "http://txz.qq.com/p?k=abc+/=&f=1")
+
+    def test_login_link_needs_token_and_is_cleared(self):
+        self.engine.release.clear()
+        self.engine.qr_png = self.qr_png("http://txz.qq.com/p?k=abc&f=1")
+        self.assertEqual(self.request("GET", "/api/login/link")[0].status, 404)
+        self.request("POST", "/api/login", {})
+        deadline = time.time() + 5
+        while self.app.login_link is None and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(self.request("GET", "/api/login/link", auth=False)[0].status, 401)
+        response, body = self.request("GET", "/api/login/link")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.getheader("Cache-Control"), "no-store")
+        data = json.loads(body)
+        self.assertEqual(data["direct"], "http://txz.qq.com/p?k=abc&f=1")
+        self.assertTrue(data["qq"].startswith("mqqapi://"))
+        self.engine.release.set()
+        self.wait_idle()
+        self.assertEqual(self.request("GET", "/api/login/link")[0].status, 404)
+
+    def test_login_window_option(self):
+        self.assertEqual(self.request("POST", "/api/login", {"window": True})[0].status, 200)
+        self.wait_idle()
+        self.assertEqual(self.engine.calls, [{"login": True}])
+
+    def test_access_urls(self):
+        self.assertEqual(json.loads(self.request("GET", "/api/access")[1]), {"urls": []})  # 只允许本机访问
+        self.assertEqual(self.request("GET", "/api/qr.svg")[0].status, 404)
+        original = cf_server.tailscale_ip
+        cf_server.tailscale_ip = lambda: "100.101.102.103"
+        try:
+            urls = cf_server.access_urls(8765, TOKEN)
+        finally:
+            cf_server.tailscale_ip = original
+        self.assertEqual(urls[0]["url"], f"http://100.101.102.103:8765/?token={TOKEN}")
+        self.assertIn("Tailscale", urls[0]["label"])
+        self.assertEqual(len(urls), 2)
+
+    def test_tailscale_ip_only_matches_its_range(self):
+        original = cf_server.socket.getaddrinfo
+        cf_server.socket.getaddrinfo = lambda *a, **k: [(0, 0, 0, "", ("192.168.1.8", 0)), (0, 0, 0, "", ("100.64.0.9", 0))]
+        try:
+            self.assertEqual(cf_server.tailscale_ip(), "100.64.0.9")
+            cf_server.socket.getaddrinfo = lambda *a, **k: [(0, 0, 0, "", ("100.128.0.1", 0)), (0, 0, 0, "", ("192.168.1.8", 0))]
+            self.assertIsNone(cf_server.tailscale_ip())
+        finally:
+            cf_server.socket.getaddrinfo = original
 
     def test_history_reads_newest_first(self):
         self.engine.ITEMS_FILE.write_text("时间,活动,道具,来源\n1,A,旧,页面提示\n2,A,新,页面提示\n", encoding="utf-8-sig")

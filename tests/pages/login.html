@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>mock login</title>
+<style>#box{display:none} #qrlogin_img{width:90px;height:90px;display:block} #qr_invalid,#qrlogin_step2{display:none}</style>
+<a id="dologin" href="javascript:;" onclick="start()">登录</a>
+<div id="box">
+  <div id="qrlogin_img"></div>
+  <div id="qr_invalid">已过期</div>
+  <div id="qrlogin_step2">已扫描</div>
+</div>
+<script>
+  function setCookie(name) { document.cookie = name + '=x; path=/; domain=.qq.com'; }
+  function start() {
+    document.getElementById('box').style.display = 'block';
+    const img = document.getElementById('qrlogin_img');
+    img.style.background = '#111';
+    const runs = Number(sessionStorage.getItem('opens') || 0) + 1;
+    sessionStorage.setItem('opens', runs);
+    if (window.__MODE === 'expire' && runs === 1) {
+      setTimeout(() => { document.getElementById('qr_invalid').style.display = 'block'; }, 300);
+      return;
+    }
+    if (window.__MODE === 'never') return;
+    setTimeout(() => { img.style.background = '#c00'; }, 500);
+    setTimeout(() => { document.getElementById('qrlogin_step2').style.display = 'block'; }, 900);
+    // 基础 Cookie 先到，access_token 晚一些，和真实登录的顺序一致
+    setTimeout(() => { setCookie('p_uin'); setCookie('p_skey'); }, 1300);
+    setTimeout(() => { setCookie('openid'); setCookie('access_token'); }, 2600);
+  }
+</script>

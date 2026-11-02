@@ -3,6 +3,7 @@
 import json
 import sys
 import tempfile
+import time
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -143,6 +144,50 @@ class BrowserTest(unittest.TestCase):
         labels = [f["label"] for k, f in self.events if k == "message"]
         self.assertIn("需手动处理", labels)
 
+    def test_exchange_and_choice_buttons_are_skipped(self):
+        status, claimed, clicks = self.run_page("ams.html", dry_run=True)
+        self.assertEqual(status, "ok")
+        buttons = [f["buttons"] for k, f in self.events if k == "preview"][0]
+        self.assertEqual(buttons, ["立即领取", "领奖"])  # 兑换和自由选的按钮文字一样，但不算
+
+    def test_region_confirm_then_real_result_is_read(self):
+        status, claimed, clicks = self.run_page("ams.html")
+        self.assertEqual(status, "ok")
+        self.assertEqual(clicks, ["道具一", "道具二"])
+        self.assertEqual([c["item"] for c in claimed], ["道具一", "道具二"])
+        texts = [f["text"] for k, f in self.events if k == "message"]
+        self.assertFalse(any(t.strip() == "确认" for t in texts), texts)  # 必须读到正文，不能只有按钮文字
+        self.assertTrue(any("绑定的大区为" in t for t in texts), texts)
+
+    def test_question_dialog_is_not_confirmed(self):
+        status, _, clicks = self.run_page("ams.html", "?mode=question")
+        self.assertEqual(status, "needs_manual")
+        self.assertEqual(self.page.evaluate("window.confirmed.filter(t => t.includes('是否'))"), [])
+        self.assertEqual(clicks[-1], "问")
+
+    def test_dialog_without_readable_text_is_not_confirmed(self):
+        status, _, _ = self.run_page("ams.html", "?mode=blank")
+        self.assertEqual(status, "needs_manual")
+        self.assertNotIn("", self.page.evaluate("window.confirmed"))
+        self.assertEqual(self.page.locator(".amsdialog_modal").count(), 1)  # 空白弹窗留在页面上，没有被点掉
+
+    def test_repeated_misses_stop_activity(self):
+        self.config.update(load_dialog_wait_ms=0, result_wait_ms=0)
+        status, _, clicks = self.run_page("ams.html", "?mode=blocked")
+        self.assertEqual(status, "failed")
+        self.assertEqual(clicks, [])
+        self.assertTrue(any("连续点不中" in f.get("text", "") for k, f in self.events if k == "notice"))
+
+    def test_action_words_match_whole_words_only(self):
+        self.page.set_content(
+            """<a id="a" href="javascript:;" onclick="this.style.display='none'">领取</a>
+               <a id="b" href="javascript:getExchange()">领取</a>
+               <a id="c" href="javascript:exchangeGift()">领取</a>
+               <a id="d" href="javascript:;" onclick="doPay()">领取</a>"""
+        )
+        found = cf_claim.find_buttons(self.page.main_frame, ["领取"], [], False, self.config)
+        self.assertEqual(found, ["领取"])  # 只有 display 那个不是兑换或付费
+
     def test_stop_request_ends_activity(self):
         seen = {"n": 0}
 
@@ -153,6 +198,78 @@ class BrowserTest(unittest.TestCase):
         status, _, clicks = self.run_page("activity.html", should_stop=stop)
         self.assertEqual(status, "stopped")
         self.assertEqual(len(clicks), 2)
+
+
+class QrLoginTest(unittest.TestCase):
+    """用本地页面冒充官网登录流程，不访问真实网站。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pw = sync_playwright().start()
+        cls.browser = cls.pw.chromium.launch(channel="chrome", headless=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.browser.close()
+        cls.pw.stop()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.auth_file = cf_claim.AUTH_FILE
+        cf_claim.AUTH_FILE = Path(self.tmp.name) / "auth.json"
+        self.context = self.browser.new_context()
+        self.page = self.context.new_page()
+        self.events = []
+        self.qrs = []
+
+    def tearDown(self):
+        self.context.close()
+        cf_claim.AUTH_FILE = self.auth_file
+        self.tmp.cleanup()
+
+    def serve(self, mode):
+        html = (PAGES / "login.html").read_text(encoding="utf-8")
+        html = html.replace("<script>", f"<script>window.__MODE = '{mode}';", 1)
+        self.context.route("https://cf.qq.com/**", lambda route: route.fulfill(status=200, body=html, content_type="text/html; charset=utf-8"))
+
+    def login(self, **kwargs):
+        emit = lambda kind, **fields: self.events.append((kind, fields))  # noqa: E731
+        return cf_claim.run_qr_login(self.page, emit, self.qrs.append, poll_ms=150, **kwargs)
+
+    def test_waits_for_access_token_before_saving(self):
+        self.serve("ok")
+        self.assertTrue(self.login(deadline=time.time() + 20))
+        names = {c["name"] for c in json.loads(cf_claim.AUTH_FILE.read_text(encoding="utf-8"))}
+        self.assertTrue({"p_uin", "p_skey", "openid", "access_token"} <= names, names)  # 只存到基础 Cookie 就关闭是错的
+        self.assertTrue(cf_claim.login_saved())
+        self.assertGreaterEqual(len(self.qrs), 2)  # 二维码变化后再次上报
+        self.assertTrue(all(png.startswith(b"\x89PNG") for png in self.qrs))
+        kinds = [k for k, _ in self.events]
+        self.assertIn("login_qr", kinds)
+        self.assertEqual(kinds.count("login_scanned"), 1)
+
+    def test_expired_qr_is_refreshed(self):
+        self.serve("expire")
+        self.assertTrue(self.login(deadline=time.time() + 20))
+        texts = [f.get("text") for k, f in self.events if k == "notice"]
+        self.assertIn("二维码已过期，正在刷新", texts)
+
+    def test_stop_keeps_existing_login(self):
+        self.serve("never")
+        cf_claim.AUTH_FILE.write_text("old", encoding="utf-8")
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 3
+
+        self.assertFalse(self.login(should_stop=stop))
+        self.assertEqual(cf_claim.AUTH_FILE.read_text(encoding="utf-8"), "old")
+
+    def test_gives_up_when_qr_never_appears(self):
+        self.context.route("https://cf.qq.com/**", lambda route: route.fulfill(status=200, body='<a id="dologin">登录</a>', content_type="text/html; charset=utf-8"))
+        self.assertFalse(self.login(deadline=time.time() + 15, missing_retry=0.2))
+        self.assertTrue(any("取不到登录二维码" in f.get("text", "") for k, f in self.events if k == "notice"))
 
 
 if __name__ == "__main__":

@@ -34,6 +34,9 @@ LOGIN_URL = "https://cf.qq.com/"
 
 CAPTCHA_URL_MARKERS = ("captcha", "turing.")
 LOGIN_URL_MARKERS = ("ptlogin2",)
+LOGIN_SETTLE_SECONDS = 20
+QR_MISSING_RETRY_SECONDS = 20
+MAX_CONSECUTIVE_MISSES = 3
 ACTIVITY_URL_RE = re.compile(r"^https?://cf\.qq\.com/(?:cp|act)/[^/?#]+", re.I)
 RESULT_WORDS = {
     "需手动处理": ("需要手动处理",),
@@ -50,7 +53,7 @@ def no_emit(kind, **fields):
 
 # 在页面内查找可点击的领取按钮。dry_run 时返回全部匹配，否则只标记第一个未点过的。
 FIND_BUTTONS_JS = """
-({claimWords, excludeWords, markFirst}) => {
+({claimWords, excludeWords, excludeActions, excludeContext, markFirst}) => {
   const tags = 'a,button,input[type=button],input[type=submit],[role=button],[onclick]';
   const textOf = el => (el.value || el.innerText || el.textContent || el.title || '').replace(/\\s+/g, '');
   const visible = el => {
@@ -62,12 +65,26 @@ FIND_BUTTONS_JS = """
     || /(^|[\\s_-])(disabled?|gray|grey|received|finished)($|[\\s_-])/i.test(el.className || '');
   // 指向其他页面的是导航链接，不是领取按钮
   const isNavLink = el => el.tagName === 'A' && /^https?:/i.test(el.href) && !el.href.includes('#');
+  // 按钮可能写着“立即领取”，实际却是兑换或多选一，所以还要看它的动作和所在区域
+  const riskyAction = el => {
+    const action = (el.getAttribute('href') || '') + ' ' + (el.getAttribute('onclick') || '');
+    // 按单词开头匹配，兼容 exchangeGift 和 getExchange，又不会把 display 当成 pay
+    return excludeActions.some(w => {
+      const capital = w[0].toUpperCase() + w.slice(1);
+      return new RegExp(`(^|[^a-zA-Z])${w}|${capital}`).test(action);
+    });
+  };
+  const riskyContext = el => {
+    const area = (el.parentElement ? el.parentElement.textContent : '').replace(/\\s+/g, '').slice(0, 300);
+    return excludeContext.some(w => area.includes(w));
+  };
   const matches = el => {
     if (isNavLink(el)) return false;
     const t = textOf(el);
     return t && t.length <= 20
       && claimWords.some(w => t.includes(w))
-      && !excludeWords.some(w => t.includes(w));
+      && !excludeWords.some(w => t.includes(w))
+      && !riskyAction(el) && !riskyContext(el);
   };
   const found = [];
   for (const el of document.querySelectorAll(tags)) {
@@ -89,20 +106,24 @@ markers => {
 }
 """
 
-# 关闭页面内的结果弹窗。弹窗内容涉及付费或绑定时不点击，只返回内容。
+# 关闭页面内的结果弹窗。只有读到完整内容且确认无风险时才点击，否则只返回内容。
 DISMISS_DIALOG_JS = """
-({dismissWords, stopWords}) => {
+({dismissWords, stopWords, questionWords, safeWords}) => {
   const dialogClass = /dialog|pop|modal|layer|alert|tips/i;
+  const clean = t => (t || '').replace(/\\s+/g, ' ').trim();
   const visible = el => {
     const r = el.getBoundingClientRect();
     const s = getComputedStyle(el);
     return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
   };
+  // 取最外层的弹窗容器。只看最近一层可能只读到按钮区域，读不到弹窗正文
   const dialogOf = el => {
-    for (let p = el.parentElement, i = 0; p && i < 8; p = p.parentElement, i++) {
-      if (getComputedStyle(p).position === 'fixed' || dialogClass.test(p.className || '') || dialogClass.test(p.id || '')) return p;
+    let found = null;
+    for (let p = el.parentElement, i = 0; p && p !== document.body && i < 10; p = p.parentElement, i++) {
+      const isDialog = getComputedStyle(p).position === 'fixed' || dialogClass.test(String(p.className || '')) || dialogClass.test(p.id || '');
+      if (isDialog && (!found || clean(p.innerText).length <= 600)) found = p;
     }
-    return null;
+    return found;
   };
   for (const el of document.querySelectorAll('a,button,input[type=button],[role=button],[onclick],span,div')) {
     if (el.children.length && !['A', 'BUTTON'].includes(el.tagName)) continue;
@@ -110,8 +131,13 @@ DISMISS_DIALOG_JS = """
     if (!dismissWords.includes(text) || !visible(el)) continue;
     const dialog = dialogOf(el);
     if (!dialog) continue;
-    const message = (dialog.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
+    const message = clean(dialog.innerText).slice(0, 200);
+    let content = message;
+    for (const word of [...dismissWords, '取消', '×']) content = content.split(word).join('');
+    if (!clean(content)) return {message: `弹窗没有可读内容（按钮：${text}）`, blocked: true};
+    const safe = safeWords.some(w => message.includes(w));
     if (stopWords.some(w => message.includes(w))) return {message, blocked: true};
+    if (questionWords.some(w => message.includes(w)) && !safe) return {message, blocked: true};
     el.click();
     return {message, blocked: false};
   }
@@ -140,12 +166,14 @@ def setup_logging():
     )
 
 
-def open_context(playwright, config, headless=False, restore_auth=True):
+def open_context(playwright, config, headless=False, restore_auth=True, device_scale_factor=None):
+    extra = {"device_scale_factor": device_scale_factor} if device_scale_factor else {}
     context = playwright.chromium.launch_persistent_context(
         str(PROFILE_DIR),
         channel=config.get("browser_channel", "chrome"),
         headless=headless,
         viewport={"width": 1280, "height": 900},
+        **extra,
     )
     # QQ 登录 Cookie 是会话级的，浏览器关闭后不会留在资料目录里，需要单独恢复
     if restore_auth and AUTH_FILE.exists():
@@ -166,6 +194,18 @@ def login_saved():
         return has_login_cookie(json.loads(AUTH_FILE.read_text(encoding="utf-8")))
     except (OSError, ValueError, KeyError, TypeError):
         return False
+
+
+def save_login_when_settled(context, page, should_stop=None, wait_seconds=LOGIN_SETTLE_SECONDS):
+    """QQ 的基础 Cookie 先到，活动需要的 access_token 要等页面跳转完成，太早关闭浏览器会丢失。"""
+    deadline = time.time() + wait_seconds
+    while True:
+        cookies = context.cookies()
+        AUTH_FILE.write_text(json.dumps(cookies, ensure_ascii=False), encoding="utf-8")
+        names = {c["name"] for c in cookies if c["domain"].endswith("qq.com") and c["value"]}
+        if {"openid", "access_token"} <= names or time.time() > deadline or (should_stop and should_stop()):
+            return
+        page.wait_for_timeout(1000)
 
 
 def stop_words(config):
@@ -312,12 +352,16 @@ def needs_login(page, config):
     return False
 
 
-def make_dialog_handler(words, messages):
+def make_dialog_handler(config, messages):
+    safe_words = config.get("safe_confirm_words", [])
+    danger = stop_words(config)
+
     def handle(dialog):
         text = dialog.message
         messages.append(text)
-        # 确认框涉及付费等内容时一律取消
-        if dialog.type == "confirm" and any(w in text for w in words):
+        # 确认框代表要做一个决定，只有明确无风险的才接受
+        safe = any(w in text for w in safe_words) and not any(w in text for w in danger)
+        if dialog.type == "confirm" and not safe:
             log.warning("  已取消确认框: %s", text)
             dialog.dismiss()
         else:
@@ -328,7 +372,12 @@ def make_dialog_handler(words, messages):
 
 def dismiss_page_dialogs(page, config, messages):
     """关闭结果弹窗并记录内容。遇到需要人工处理的弹窗时返回 False。"""
-    args = {"dismissWords": config.get("dismiss_words", []), "stopWords": stop_words(config)}
+    args = {
+        "dismissWords": config.get("dismiss_words", []),
+        "stopWords": stop_words(config),
+        "questionWords": config.get("question_words", []),
+        "safeWords": config.get("safe_confirm_words", []),
+    }
     for _ in range(3):
         result = None
         for frame in safe_frames(page):
@@ -351,31 +400,40 @@ def dismiss_page_dialogs(page, config, messages):
 
 def wait_for_page_dialog(page, config, messages, timeout_ms):
     """弹窗常常晚于点击出现，等到出现一个或超时为止。遇到需要人工处理的弹窗时返回 False。"""
-    seen = len(messages)
+    # 大区确认只是过场，真正的结果在它之后才弹出来
+    safe_words = config.get("safe_confirm_words", [])
+    results = lambda: sum(not any(w in m for w in safe_words) for m in messages)  # noqa: E731
+    seen = results()
     waited = 0
     while True:
         if not dismiss_page_dialogs(page, config, messages):
             return False
-        if len(messages) > seen or waited >= timeout_ms:
+        if results() > seen or waited >= timeout_ms:
             return True
         page.wait_for_timeout(500)
         waited += 500
 
 
-def find_buttons(frame, claim_words, exclude_words, mark_first):
+def find_buttons(frame, claim_words, exclude_words, mark_first, config):
     try:
         return frame.evaluate(
             FIND_BUTTONS_JS,
-            {"claimWords": claim_words, "excludeWords": exclude_words, "markFirst": mark_first},
+            {
+                "claimWords": claim_words,
+                "excludeWords": exclude_words,
+                "excludeActions": config.get("exclude_actions", []),
+                "excludeContext": config.get("exclude_context_words", []),
+                "markFirst": mark_first,
+            },
         )
     except PlaywrightError:
         return []
 
 
-def click_next(page, claim_words, exclude_words, delay_ms):
+def click_next(page, claim_words, exclude_words, delay_ms, config):
     """点击下一个未处理的按钮，返回 (按钮文字, 是否点中)；没有按钮时文字为 None。"""
     for frame in safe_frames(page):
-        found = find_buttons(frame, claim_words, exclude_words, mark_first=True)
+        found = find_buttons(frame, claim_words, exclude_words, True, config)
         if not found:
             continue
         target = frame.locator("[data-cf-target]").first
@@ -425,13 +483,13 @@ def process_activity(page, activity, config, dry_run, headless, stats=None, clai
         return "failed"
 
     if dry_run:
-        buttons = [b for f in safe_frames(page) for b in find_buttons(f, claim_words, exclude_words, False)]
+        buttons = [b for f in safe_frames(page) for b in find_buttons(f, claim_words, exclude_words, False, config)]
         log.info("  [预览] 匹配到 %d 个按钮: %s", len(buttons), buttons)
         emit("preview", activity=name, buttons=buttons)
         return "ok"
 
     messages = []
-    handler = make_dialog_handler(stop_words(config) + exclude_words, messages)
+    handler = make_dialog_handler(config, messages)
     page.on("dialog", handler)
     responses = []
     # 同一件道具可能同时出现在接口返回和页面提示里，互相抵消后只记一次
@@ -480,6 +538,7 @@ def process_activity(page, activity, config, dry_run, headless, stats=None, clai
     status = "ok"
     clicks = 0
     attempts = 0
+    misses = 0
     closed = False
     try:
         # 有些页面加载后才弹窗，会挡住后面的按钮
@@ -496,17 +555,25 @@ def process_activity(page, activity, config, dry_run, headless, stats=None, clai
             if should_stop and should_stop():
                 status = "stopped"
                 break
-            text, clicked = click_next(page, claim_words, exclude_words, delay_ms)
+            text, clicked = click_next(page, claim_words, exclude_words, delay_ms, config)
             if text is None:
                 break
             attempts += 1
             if clicked:
                 clicks += 1
+                misses = 0
                 log.info("  点击: %s", text)
             else:
+                misses += 1
                 stats["未点中"] += 1
                 log.warning("  按钮无法点击: %s", text)
             emit("click", activity=name, text=text, clicked=clicked)
+            if misses >= MAX_CONSECUTIVE_MISSES:
+                # 多半被读不懂的弹窗挡住了，继续点没有意义
+                log.warning("  连续 %d 次点不中，已停止本活动", misses)
+                emit("notice", level="error", text=f"{name}：连续点不中按钮，已停止本活动")
+                status = "failed"
+                break
             if not wait_for_captcha(page, config, headless):
                 emit("notice", level="error", text=captcha_text)
                 status = "failed"
@@ -565,6 +632,7 @@ def cmd_login(config, emit=no_emit, auto_close=False, should_stop=None, timeout_
                         say("已检测到登录，可以关闭浏览器窗口了。")
                     saved = True
                     if auto_close:
+                        save_login_when_settled(context, context.pages[0], should_stop)
                         break
                 if (should_stop and should_stop()) or (deadline and time.time() > deadline):
                     break
@@ -581,6 +649,93 @@ def cmd_login(config, emit=no_emit, auto_close=False, should_stop=None, timeout_
         return 1
     say("登录状态已保存。")
     return 0
+
+
+def open_qr_page(page):
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(1000)
+    page.locator("#dologin").click(timeout=15000)
+
+
+def find_qr_frame(page):
+    for frame in safe_frames(page):
+        try:
+            if frame.locator("#qrlogin_img").is_visible():
+                return frame
+        except PlaywrightError:
+            continue
+    return None
+
+
+def is_visible(frame, selector):
+    try:
+        return frame.locator(selector).is_visible()
+    except PlaywrightError:
+        return False
+
+
+def run_qr_login(page, emit, on_qr, should_stop=None, deadline=None, poll_ms=1000, missing_retry=QR_MISSING_RETRY_SECONDS):
+    """在后台打开官方登录页，把二维码交给 on_qr，等手机扫码确认。返回是否登录成功。"""
+    context = page.context
+    context.clear_cookies()
+    open_qr_page(page)
+    last_png = None
+    version = 0
+    scanned = False
+    missing_since = time.time()
+    retries = 0
+    while not (should_stop and should_stop()) and not (deadline and time.time() > deadline):
+        if has_login_cookie(context.cookies()):
+            save_login_when_settled(context, page, should_stop)
+            return True
+        frame = find_qr_frame(page)
+        if frame:
+            missing_since = time.time()
+            if is_visible(frame, "#qrlogin_step2") and not scanned:
+                scanned = True
+                emit("login_scanned")
+            if is_visible(frame, "#qr_invalid") and not scanned:
+                emit("notice", level="info", text="二维码已过期，正在刷新")
+                open_qr_page(page)
+                last_png = None
+                continue
+            try:
+                png = frame.locator("#qrlogin_img").screenshot(timeout=3000)
+            except PlaywrightError:
+                png = None
+            if png and png != last_png:
+                last_png = png
+                version += 1
+                on_qr(png)
+                emit("login_qr", version=version)
+        elif not scanned and time.time() - missing_since > missing_retry:
+            retries += 1
+            if retries > 2:
+                emit("notice", level="error", text="取不到登录二维码，可以改用电脑上的登录窗口")
+                return False
+            open_qr_page(page)
+            missing_since = time.time()
+        page.wait_for_timeout(poll_ms)
+    return False
+
+
+def cmd_qr_login(config, emit=no_emit, on_qr=None, should_stop=None, timeout_seconds=None):
+    """页面内扫码登录。人不在电脑旁时用这个。登录成功前不会覆盖已保存的登录信息。"""
+    deadline = time.time() + timeout_seconds if timeout_seconds else None
+    with sync_playwright() as p:
+        # 放大截图，二维码在手机上才足够清晰
+        context = open_context(p, config, headless=True, restore_auth=False, device_scale_factor=4)
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            saved = run_qr_login(page, emit, on_qr or (lambda png: None), should_stop, deadline)
+        finally:
+            context.close()
+    if saved:
+        emit("notice", level="info", text="登录成功，登录状态已保存")
+        return 0
+    if not (should_stop and should_stop()):
+        emit("notice", level="error", text="没有完成登录，请重试")
+    return 1
 
 
 def fetch_activities(config):

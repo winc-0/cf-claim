@@ -41,7 +41,17 @@
       <span id="login-state" class="pill">检查中</span>
       <button id="btn-login" type="button" class="ghost">登录 QQ</button>
     </div>
-    <p id="login-hint" class="muted small" hidden>登录窗口会在运行本程序的电脑上打开，需要在电脑旁扫码。</p>
+    <div id="login-panel" class="login-panel" hidden>
+      <img id="login-qr" class="qr" alt="QQ 登录二维码" width="240" height="240" hidden>
+      <p id="login-status" class="small">正在获取二维码…</p>
+      <p class="muted small">用手机 QQ 扫一扫。只有这一部手机时，可以截图后在扫一扫里从相册选择。这个二维码能登录你的账号，不要发给别人。</p>
+      <div id="login-links" class="login-links" hidden>
+        <a id="link-qq" class="button primary" rel="noreferrer">在 QQ 中确认（试验）</a>
+        <a id="link-direct" class="button ghost" rel="noreferrer" target="_blank">用方式二打开（试验）</a>
+        <p class="muted small">手机上使用。依赖 QQ 的非公开跳转，可能打不开或只提示去扫码。打不开时继续用扫码。</p>
+      </div>
+    </div>
+    <button id="btn-login-window" type="button" class="link">改用电脑上的登录窗口</button>
 
     <div class="section-head">
       <h2>选择活动</h2>
@@ -79,11 +89,9 @@
 
   <details class="panel" id="phone-box">
     <summary>在手机上打开</summary>
-    <div id="phone-on">
-      <p class="muted small">手机连接同一个 Wi-Fi 后扫码。二维码和链接都含访问口令，不要发给别人。</p>
-      <img id="phone-qr" class="qr" alt="手机访问二维码" width="200" height="200">
-      <p id="phone-url" class="url small"></p>
-    </div>
+    <p class="muted small">用手机扫码打开。二维码和链接都含访问口令，不要发给别人。</p>
+    <div id="phone-list"></div>
+    <p id="phone-remote-hint" class="muted small" hidden>要在外面用流量打开，先在电脑和手机上都安装并登录 Tailscale，再刷新本页，这里会多出一个二维码。</p>
     <p id="phone-off" class="muted small" hidden>当前只允许本机访问。去掉 --local 启动后可用手机打开。</p>
   </details>
 </main>
