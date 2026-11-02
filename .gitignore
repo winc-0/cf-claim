@@ -1,0 +1,11 @@
+# 登录凭证和浏览器资料，绝对不能上传
+auth_cookies.json
+browser_profile/
+
+# 运行记录
+claim.log
+claimed_items.csv
+
+__pycache__/
+*.pyc
+.venv/
