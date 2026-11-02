@@ -6,13 +6,40 @@
 
 ## 安装
 
-需要 Python 3 和已安装的 Chrome。
+需要 Python 3 和已安装的 Chrome。桌面版还需要 Edge WebView2 运行时，Windows 11 通常已自带。
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-## 使用
+## 网页版和桌面版
+
+两个版本显示同一个页面：实时显示每一步的结果和领到的道具名称，也能选择活动、预览、停止和查看历史记录。领取始终在运行程序的电脑上进行，手机只负责查看和操作。
+
+桌面版，打开一个独立窗口：
+
+```bash
+python cf_desktop.py
+```
+
+网页版，启动后按终端输出的链接打开：
+
+```bash
+python cf_server.py
+```
+
+### 在手机上打开
+
+1. 手机连接和电脑相同的 Wi-Fi。Windows 防火墙询问时，允许专用网络访问。
+2. 在页面的“在手机上打开”里扫码，或打开终端输出的手机链接。
+
+- 只能在同一局域网内访问，这个程序不提供外网访问。
+- 链接和二维码含访问口令，不要发给别人。打开过一次后，口令会存成 Cookie，并从地址栏消失。
+- 如果口令泄露，退出程序并删除 `web_token.txt`，下次启动会生成新口令。
+- 不需要手机访问时，加 `--local` 只允许本机访问。
+- “登录 QQ”的窗口总是在电脑上打开，需要在电脑旁扫码。
+
+## 命令行
 
 先登录一次。终端显示“已检测到登录”后再关闭浏览器窗口：
 
@@ -69,7 +96,13 @@ python cf_claim.py run --discover --only a20261022nov
 
 ## 不能上传的文件
 
-`auth_cookies.json` 和 `browser_profile/` 等同登录凭证，已写入 `.gitignore`，不要提交或发给别人。
+`auth_cookies.json` 和 `browser_profile/` 等同登录凭证，`web_token.txt` 是网页版的访问口令。它们都已写入 `.gitignore`，不要提交或发给别人。
+
+## 测试
+
+```bash
+python -m unittest discover -s tests
+```
 
 ## 限制和风险
 

@@ -36,12 +36,17 @@ CAPTCHA_URL_MARKERS = ("captcha", "turing.")
 LOGIN_URL_MARKERS = ("ptlogin2",)
 ACTIVITY_URL_RE = re.compile(r"^https?://cf\.qq\.com/(?:cp|act)/[^/?#]+", re.I)
 RESULT_WORDS = {
+    "需手动处理": ("需要手动处理",),
     "成功": ("成功", "恭喜", "获得"),
     "已领过": ("已领", "已经领", "领取过", "已参与", "上限", "次数不足", "已达"),
     "未开放或不满足条件": ("不在", "未开始", "已结束", "未开放", "将于", "敬请期待", "不满足", "未达到", "没有资格", "不符合"),
 }
 
 log = logging.getLogger("cf_claim")
+
+
+def no_emit(kind, **fields):
+    """默认不上报事件；网页版传入自己的回调来实时显示进度。"""
 
 # 在页面内查找可点击的领取按钮。dry_run 时返回全部匹配，否则只标记第一个未点过的。
 FIND_BUTTONS_JS = """
@@ -127,6 +132,14 @@ def load_config(path):
         return json.load(f)
 
 
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+        handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")],
+    )
+
+
 def open_context(playwright, config, headless=False, restore_auth=True):
     context = playwright.chromium.launch_persistent_context(
         str(PROFILE_DIR),
@@ -146,6 +159,13 @@ def has_login_cookie(cookies):
     # 新版活动页走开放平台登录，Cookie 里是 openid 和 access_token
     connect_login = {"openid", "access_token"} <= names
     return qq_login or connect_login
+
+
+def login_saved():
+    try:
+        return has_login_cookie(json.loads(AUTH_FILE.read_text(encoding="utf-8")))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def stop_words(config):
@@ -219,9 +239,8 @@ def save_claimed(claimed):
         writer = csv.writer(f)
         if new_file:
             writer.writerow(["时间", "活动", "道具", "来源"])
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
         for entry in claimed:
-            writer.writerow([now, entry["activity"], entry["item"], entry["source"]])
+            writer.writerow([entry["time"], entry["activity"], entry["item"], entry["source"]])
 
 
 def discover_activities(page, config, url=LOGIN_URL):
@@ -323,6 +342,7 @@ def dismiss_page_dialogs(page, config, messages):
             return True
         if result["blocked"]:
             log.warning("  弹窗需要手动处理，已停止本活动: %s", result["message"])
+            messages.append(f"需要手动处理：{result['message']}")
             return False
         messages.append(result["message"])
         page.wait_for_timeout(500)
@@ -382,7 +402,7 @@ def click_next(page, claim_words, exclude_words, delay_ms):
     return None, False
 
 
-def process_activity(page, activity, config, dry_run, headless, stats=None, claimed=None):
+def process_activity(page, activity, config, dry_run, headless, stats=None, claimed=None, emit=no_emit, should_stop=None):
     stats = Counter() if stats is None else stats
     claimed = [] if claimed is None else claimed
     name = activity.get("name", activity["url"])
@@ -390,6 +410,7 @@ def process_activity(page, activity, config, dry_run, headless, stats=None, clai
     exclude_words = config["exclude_words"] + activity.get("exclude_words", [])
     max_clicks = activity.get("max_clicks", config.get("max_clicks", 20))
     delay_ms = config.get("click_delay_ms", 2500)
+    captcha_text = "遇到验证码，后台无法处理。请勾选显示浏览器窗口后重试，并在电脑上手动完成"
 
     log.info("活动: %s", name)
     page.goto(activity["url"], wait_until="domcontentloaded", timeout=30000)
@@ -397,25 +418,64 @@ def process_activity(page, activity, config, dry_run, headless, stats=None, clai
 
     if needs_login(page, config):
         log.error("  未登录或登录已失效，请先运行: python cf_claim.py login")
+        emit("notice", level="error", text="未登录或登录已失效，请重新登录")
         return "need_login"
     if not wait_for_captcha(page, config, headless):
+        emit("notice", level="error", text=captcha_text)
         return "failed"
 
     if dry_run:
         buttons = [b for f in safe_frames(page) for b in find_buttons(f, claim_words, exclude_words, False)]
         log.info("  [预览] 匹配到 %d 个按钮: %s", len(buttons), buttons)
+        emit("preview", activity=name, buttons=buttons)
         return "ok"
 
     messages = []
     handler = make_dialog_handler(stop_words(config) + exclude_words, messages)
     page.on("dialog", handler)
     responses = []
-    response_items = []
+    # 同一件道具可能同时出现在接口返回和页面提示里，互相抵消后只记一次
+    unmatched_response = []
+    unmatched_page = []
+    reported = 0
 
     def on_response(response):
         host = urlsplit(response.url).netloc
         if host.endswith("game.qq.com") and response.request.method == "POST":
             responses.append(response)
+
+    def record(item, source):
+        entry = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "activity": name, "item": item, "source": source}
+        claimed.append(entry)
+        save_claimed([entry])
+        log.info("  领到: %s（来源：%s）", item, source)
+        emit("item", **entry)
+
+    def report_progress():
+        nonlocal reported
+        for item in read_response_items(responses):
+            if item in unmatched_page:
+                unmatched_page.remove(item)
+            else:
+                unmatched_response.append(item)
+                record(item, "接口返回")
+        while reported < len(messages):
+            msg = messages[reported]
+            reported += 1
+            label = classify(msg)
+            stats[label] += 1
+            log.info("  [%s] %s", label, msg)
+            emit("message", activity=name, label=label, text=msg)
+            if label != "成功":
+                continue
+            known = next((i for i in unmatched_response if i in msg), None)
+            if known:
+                unmatched_response.remove(known)
+                continue
+            item = item_from_message(msg, config)
+            if item:
+                unmatched_page.append(item)
+            record(item or f"未写明道具名：{msg}", "页面提示")
 
     status = "ok"
     clicks = 0
@@ -430,53 +490,53 @@ def process_activity(page, activity, config, dry_run, headless, stats=None, clai
             log.info("  活动未开放，已跳过")
             closed = True
             attempts = max_clicks
+        report_progress()
         page.on("response", on_response)
         while attempts < max_clicks:
+            if should_stop and should_stop():
+                status = "stopped"
+                break
             text, clicked = click_next(page, claim_words, exclude_words, delay_ms)
             if text is None:
                 break
             attempts += 1
-            for item in read_response_items(responses):
-                if item not in response_items:
-                    response_items.append(item)
             if clicked:
                 clicks += 1
                 log.info("  点击: %s", text)
             else:
                 stats["未点中"] += 1
                 log.warning("  按钮无法点击: %s", text)
+            emit("click", activity=name, text=text, clicked=clicked)
             if not wait_for_captcha(page, config, headless):
+                emit("notice", level="error", text=captcha_text)
                 status = "failed"
                 break
             result_wait = config.get("result_wait_ms", 3000) if clicked else 0
             if not wait_for_page_dialog(page, config, messages, result_wait):
                 status = "needs_manual"
                 break
+            report_progress()
         else:
             if status == "ok" and not closed:
                 log.warning("  已达到单页点击上限 %d", max_clicks)
     finally:
         page.remove_listener("dialog", handler)
         page.remove_listener("response", on_response)
-    for item in read_response_items(responses):
-        if item not in response_items:
-            response_items.append(item)
+    report_progress()
 
     log.info("  完成，点击 %d 次", clicks)
     stats["点击"] += clicks
-    for item in response_items:
-        claimed.append({"activity": name, "item": item, "source": "接口返回"})
-    for msg in messages:
-        label = classify(msg)
-        stats[label] += 1
-        log.info("  [%s] %s", label, msg)
-        if label == "成功" and not any(item in msg for item in response_items):
-            item = item_from_message(msg, config)
-            claimed.append({"activity": name, "item": item or f"未写明道具名：{msg}", "source": "页面提示"})
     return status
 
 
-def cmd_login(config):
+def cmd_login(config, emit=no_emit, auto_close=False, should_stop=None, timeout_seconds=None):
+    """打开浏览器等待登录。网页版使用 auto_close，检测到登录后自动关闭窗口。"""
+
+    def say(text):
+        print(text)
+        emit("notice", level="info", text=text)
+
+    deadline = time.time() + timeout_seconds if timeout_seconds else None
     with sync_playwright() as p:
         context = open_context(p, config, restore_auth=False)
         page = context.pages[0] if context.pages else context.new_page()
@@ -485,10 +545,13 @@ def cmd_login(config):
                 page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
                 break
             except PlaywrightError as e:
-                print(f"打开官网失败（第 {attempt + 1} 次）: {e.message.splitlines()[0]}")
+                say(f"打开官网失败（第 {attempt + 1} 次）: {e.message.splitlines()[0]}")
         else:
-            print(f"官网暂时打不开，请在浏览器窗口里手动刷新或访问 {LOGIN_URL}")
-        print("请在打开的浏览器中登录 QQ，看到“已检测到登录”后关闭浏览器窗口。")
+            say(f"官网暂时打不开，请在浏览器窗口里手动刷新或访问 {LOGIN_URL}")
+        if auto_close:
+            say("登录窗口已在电脑上打开，请在电脑旁完成登录，成功后窗口会自动关闭。")
+        else:
+            say("请在打开的浏览器中登录 QQ，看到“已检测到登录”后关闭浏览器窗口。")
         saved = False
         names = set()
         try:
@@ -498,9 +561,13 @@ def cmd_login(config):
                 names = {c["name"] for c in cookies if c["domain"].endswith("qq.com") and c["value"]}
                 if has_login_cookie(cookies):
                     AUTH_FILE.write_text(json.dumps(cookies, ensure_ascii=False), encoding="utf-8")
-                    if not saved:
-                        print("已检测到登录，可以关闭浏览器窗口了。")
+                    if not saved and not auto_close:
+                        say("已检测到登录，可以关闭浏览器窗口了。")
                     saved = True
+                    if auto_close:
+                        break
+                if (should_stop and should_stop()) or (deadline and time.time() > deadline):
+                    break
         except PlaywrightError:
             pass  # 用户关闭了窗口
         try:
@@ -508,20 +575,25 @@ def cmd_login(config):
         except PlaywrightError:
             pass
     if not saved:
-        print("没有检测到登录，请重新运行 login。")
+        say("没有检测到登录，请重新登录。")
         # 只输出名称不输出值，用来排查登录方式
         print("已有的 Cookie 名称:", ", ".join(sorted(names)) or "无")
         return 1
-    print("登录状态已保存。")
+    say("登录状态已保存。")
     return 0
 
 
-def cmd_discover(config):
+def fetch_activities(config):
     with sync_playwright() as p:
         context = open_context(p, config, headless=True)
         page = context.pages[0] if context.pages else context.new_page()
         activities = discover_activities(page, config)
         context.close()
+    return activities
+
+
+def cmd_discover(config):
+    activities = fetch_activities(config)
     print(f"发现 {len(activities)} 个活动页:")
     for activity in activities:
         print(f"  {activity['name']}  {activity['url']}")
@@ -531,7 +603,6 @@ def cmd_discover(config):
 def report_claimed(claimed, dry_run):
     if dry_run:
         return
-    save_claimed(claimed)
     if not claimed:
         log.info("本次没有领到道具")
         return
@@ -541,41 +612,59 @@ def report_claimed(claimed, dry_run):
     log.info("明细已追加到 %s", ITEMS_FILE.name)
 
 
-def cmd_run(config, dry_run, headless, discover=False, only=None):
+def cmd_run(config, dry_run, headless, discover=False, only=None, activities=None, emit=no_emit, should_stop=None):
     configured = config.get("activities", [])
     failed = 0
     stats = Counter()
     claimed = []
+    code = None
+    stopped = False
     with sync_playwright() as p:
         context = open_context(p, config, headless)
         page = context.pages[0] if context.pages else context.new_page()
-        discovered = discover_activities(page, config) if discover else []
-        activities = merge_activities(configured, discovered)
-        if only:
-            activities = [a for a in activities if only in a.get("name", "") or only in a["url"]]
+        if activities is None:
+            discovered = discover_activities(page, config) if discover else []
+            activities = merge_activities(configured, discovered)
+            if only:
+                activities = [a for a in activities if only in a.get("name", "") or only in a["url"]]
         if not activities:
             log.error("没有可处理的活动")
+            emit("notice", level="error", text="没有可处理的活动")
             context.close()
+            emit("run_done", code=1, stats={}, claimed=0, stopped=False, failed=0, total=0)
             return 1
-        for activity in activities:
+        emit("run_start", total=len(activities), dry_run=dry_run)
+        for index, activity in enumerate(activities, 1):
+            if should_stop and should_stop():
+                stopped = True
+                break
+            name = activity.get("name", activity["url"])
+            emit("activity_start", activity=name, index=index, total=len(activities))
             try:
-                result = process_activity(page, activity, config, dry_run, headless, stats, claimed)
+                result = process_activity(page, activity, config, dry_run, headless, stats, claimed, emit, should_stop)
             except PlaywrightError as e:
                 log.error("  处理失败: %s", e)
+                emit("notice", level="error", text=f"{name}：页面处理失败")
                 result = "failed"
+            emit("activity_done", activity=name, status=result)
             if result == "need_login":
-                context.close()
-                report_claimed(claimed, dry_run)
-                return 2
+                code = 2
+                break
+            if result == "stopped":
+                stopped = True
+                break
             failed += result != "ok"
             # 点击可能打开新标签页，处理完一个活动就关掉
             for extra in context.pages:
                 if extra is not page:
                     extra.close()
         context.close()
-    log.info("全部结束: 共 %d 个活动，未完成 %d 个，统计 %s", len(activities), failed, dict(stats))
+    if code is None:
+        log.info("全部结束: 共 %d 个活动，未完成 %d 个，统计 %s", len(activities), failed, dict(stats))
+        code = 1 if failed else 0
     report_claimed(claimed, dry_run)
-    return 1 if failed else 0
+    emit("run_done", code=code, stats=dict(stats), claimed=len(claimed), stopped=stopped, failed=failed, total=len(activities))
+    return code
 
 
 def main():
@@ -591,11 +680,7 @@ def main():
     run.add_argument("--only", help="只处理名称或网址包含该文字的活动")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")],
-    )
+    setup_logging()
     config = load_config(args.config)
     if args.command == "login":
         return cmd_login(config)

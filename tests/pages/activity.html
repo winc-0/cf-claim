@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>mock activity</title>
+<style>#dlg{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:#fff;z-index:9}</style>
+<script>
+  window.clicks = [];
+  function post(body) { return fetch('https://cf.ams.game.qq.com/ide/', {method: 'POST', body}); }
+  function show(text, ms) {
+    setTimeout(() => { document.getElementById('txt').innerText = text; document.getElementById('dlg').style.display = 'block'; }, ms || 0);
+  }
+  function hit(name) { window.clicks.push(name); }
+  var q = new URLSearchParams(location.search);
+  if (q.get('load')) show(q.get('load'), 800);
+</script>
+<a href="javascript:;" onclick="hit('late'); show('恭喜您获得了礼包： 许愿币 确定 ×', 1200)">立即领取</a>
+<a href="javascript:;" onclick="hit('same'); show('恭喜您获得了礼包： 许愿币', 0)">领奖</a>
+<a href="javascript:;" onclick="hit('note'); show('恭喜您获得了礼包： 掌火礼包 , 请注意：游戏虚拟道具奖品将会在24小时内到账', 0)">点击领取</a>
+<a href="javascript:;" onclick="hit('api'); post('ok1')">领取奖励</a>
+<a href="javascript:;" onclick="hit('both'); post('ok2'); show('恭喜获得 AK47-火麒麟 7天', 0)">立即领</a>
+<a href="javascript:;" onclick="hit('fail'); post('fail')">每日签到</a>
+<a href="javascript:;" onclick="hit('query'); post('query&iPageSize=30')">签到领取</a>
+<a href="javascript:;" onclick="hit('plain'); alert('领取成功')">立即领取奖励</a>
+<a href="javascript:;" onclick="hit('again'); show('抱歉，您已在本大区领取过了~', 0)">领取礼包</a>
+<a href="javascript:;" onclick="hit('BAD-done')">已领取</a>
+<a href="javascript:;" onclick="hit('BAD-pay')">充值领取</a>
+<a href="javascript:;" onclick="hit('BAD-soon')">即将开放领取</a>
+<a href="javascript:;" class="btn disabled" onclick="hit('BAD-disabled')">领取</a>
+<a href="javascript:;" style="display:none" onclick="hit('BAD-hidden')">领取</a>
+<a href="https://cf.qq.com/cp/a1/index.html" target="_blank">网吧福利限时领取</a>
+<div id="dlg"><p id="txt"></p><a href="javascript:;" onclick="this.parentNode.style.display='none'">确定</a></div>

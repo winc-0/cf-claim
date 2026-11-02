@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14171c" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f5f6f8" media="(prefers-color-scheme: light)">
+<title>CF 活动领取</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>CF 活动领取</h1>
+  <span id="conn" class="conn" role="status">连接中</span>
+</header>
+
+<main class="page">
+  <section class="status" aria-live="polite">
+    <div class="status-line">
+      <strong id="headline">空闲</strong>
+      <span id="progress-text" class="muted"></span>
+    </div>
+    <div class="bar" id="bar" hidden><div id="bar-fill"></div></div>
+    <p id="current" class="muted current"></p>
+    <dl class="counts">
+      <div class="count ok"><dt>成功</dt><dd id="n-ok">0</dd></div>
+      <div class="count done"><dt>已领过</dt><dd id="n-done">0</dd></div>
+      <div class="count closed"><dt>未开放</dt><dd id="n-closed">0</dd></div>
+      <div class="count bad"><dt>未完成</dt><dd id="n-bad">0</dd></div>
+    </dl>
+  </section>
+
+  <section class="panel">
+    <h2>本次领到的道具 <span id="item-count" class="tally">0</span></h2>
+    <ul id="items" class="items"></ul>
+    <p id="items-empty" class="empty">还没有领到道具。</p>
+  </section>
+
+  <section class="panel controls">
+    <div class="login-row">
+      <span id="login-state" class="pill">检查中</span>
+      <button id="btn-login" type="button" class="ghost">登录 QQ</button>
+    </div>
+    <p id="login-hint" class="muted small" hidden>登录窗口会在运行本程序的电脑上打开，需要在电脑旁扫码。</p>
+
+    <div class="section-head">
+      <h2>选择活动</h2>
+      <div class="links">
+        <button id="btn-all" type="button" class="link">全选</button>
+        <button id="btn-none" type="button" class="link">清空</button>
+        <button id="btn-refresh" type="button" class="link">刷新列表</button>
+      </div>
+    </div>
+    <ul id="activities" class="activities"></ul>
+    <p id="activities-empty" class="empty" hidden>目前只有固定活动，点“刷新列表”从官网获取更多。</p>
+    <p class="muted small">脚本看不到活动规则，无法识别多选一和无提示的扣积分。按钮多的活动请先看规则，或先预览。</p>
+
+    <label class="check"><input id="opt-show" type="checkbox"> 在电脑上显示浏览器窗口（遇到验证码时使用）</label>
+
+    <div class="actions">
+      <button id="btn-run" type="button" class="primary">开始领取</button>
+      <button id="btn-preview" type="button" class="ghost">只预览</button>
+      <button id="btn-stop" type="button" class="danger" hidden>停止</button>
+    </div>
+    <p id="action-error" class="error small" role="alert" hidden></p>
+  </section>
+
+  <section class="panel">
+    <h2>实时记录</h2>
+    <ol id="feed" class="feed"></ol>
+    <p id="feed-empty" class="empty">开始后这里会逐条显示结果。</p>
+  </section>
+
+  <details class="panel" id="history-box">
+    <summary>历史领取记录</summary>
+    <ul id="history" class="items history"></ul>
+    <p id="history-empty" class="empty" hidden>还没有记录。</p>
+  </details>
+
+  <details class="panel" id="phone-box">
+    <summary>在手机上打开</summary>
+    <div id="phone-on">
+      <p class="muted small">手机连接同一个 Wi-Fi 后扫码。二维码和链接都含访问口令，不要发给别人。</p>
+      <img id="phone-qr" class="qr" alt="手机访问二维码" width="200" height="200">
+      <p id="phone-url" class="url small"></p>
+    </div>
+    <p id="phone-off" class="muted small" hidden>当前只允许本机访问。去掉 --local 启动后可用手机打开。</p>
+  </details>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

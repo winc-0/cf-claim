@@ -1,0 +1,7 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>#pay{display:none;position:fixed;top:50px;left:300px;background:#fff}</style>
+<script>window.clicks = [];</script>
+<a href="javascript:;" onclick="window.clicks.push('first'); document.getElementById('pay').style.display='block'">立即领取</a>
+<a href="javascript:;" onclick="window.clicks.push('BAD-second')">领奖</a>
+<div id="pay"><p>本次领取将扣除 100 点券</p><a href="javascript:;" onclick="window.clicks.push('BAD-confirm')">确定</a></div>

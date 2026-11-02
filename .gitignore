@@ -9,3 +9,7 @@ claimed_items.csv
 __pycache__/
 *.pyc
 .venv/
+
+# 网页版访问口令和本地缓存
+web_token.txt
+activities_cache.json
