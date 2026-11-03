@@ -43,7 +43,8 @@
 
 [hidden] { display: none !important; }
 
-html { -webkit-text-size-adjust: 100%; }
+/* 新记录插在最上面，浏览器默认会滚动页面保持旧内容不动，新记录就跑到屏幕外了 */
+html { -webkit-text-size-adjust: 100%; overflow-anchor: none; }
 
 body {
   margin: 0;
@@ -202,7 +203,7 @@ button:focus-visible, summary:focus-visible, input:focus-visible { outline: 2px 
 .actions .danger { grid-column: 1 / -1; }
 #action-error { margin-top: 8px; }
 
-.feed { display: grid; gap: 8px; max-height: 420px; overflow-y: auto; overscroll-behavior: contain; }
+.feed { overflow-anchor: none; display: grid; gap: 8px; max-height: 420px; overflow-y: auto; overscroll-behavior: contain; }
 .feed li { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; align-items: baseline; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
 .feed li:last-child { border-bottom: 0; padding-bottom: 0; }
 .feed .tag { padding: 0 6px; border-radius: 4px; background: var(--neutral-bg); font-size: 12px; white-space: nowrap; }

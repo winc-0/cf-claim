@@ -324,6 +324,7 @@ class BrowserTest(unittest.TestCase):
         recent = f"https://cf.qq.com/cp/a{date.today():%Y%m%d}x/"
         hint = lambda name, url=recent: cf_claim.optional_hint({"name": name, "url": url}, self.config)  # noqa: E731
         self.assertIn("网吧", hint("11月网吧福利 稀有套装限时领取"))
+        self.assertIn("回归玩家", hint("11月回流专属 领神器大礼包"))
         self.assertEqual(hint("11月灵狐的约定"), "")
         self.assertEqual(hint("冬季幸运礼", "https://act.daoju.qq.com/cp/a20261110x/"), cf_claim.OTHER_SITE_HINT)
         self.assertEqual(hint("英雄计划", "https://cf.qq.com/cp/a20200702x/"), cf_claim.OLD_ACTIVITY_HINT)
