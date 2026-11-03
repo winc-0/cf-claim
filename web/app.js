@@ -2,6 +2,7 @@
 
 const $ = (id) => document.getElementById(id);
 const UNCHECKED_KEY = "cf-unchecked-activities";
+const OPTIONAL_KEY = "cf-checked-optional-activities";
 const CONSENT_KEY = "cf-consent-v1";
 const LABEL_CLASS = {
   "成功": "ok",
@@ -43,11 +44,16 @@ function writeStored(key, value) {
 }
 
 function uncheckedUrls() {
-  return [...document.querySelectorAll("#activities input:not(:checked)")].map((box) => box.value);
+  return [...document.querySelectorAll("#activities input:not(:checked):not([data-optional])")].map((box) => box.value);
+}
+
+function checkedOptionalUrls() {
+  return [...document.querySelectorAll("#activities input[data-optional]:checked")].map((box) => box.value);
 }
 
 function saveSelection() {
   writeStored(UNCHECKED_KEY, uncheckedUrls());
+  writeStored(OPTIONAL_KEY, checkedOptionalUrls());
 }
 
 function selectedUrls() {
@@ -206,6 +212,9 @@ function handleEvent(event) {
       else run.finished = "结束，本次没有领到道具";
       addFeed("结束", event.claimed > 0 ? "ok" : "", run.finished, event.ts);
       break;
+    case "login_slow":
+      if (view.busy === "login") $("login-status").textContent = "网络有点慢，正在重试…";
+      break;
     case "login_qr":
       // 重放历史事件时可能收到旧二维码，只有正在登录才显示
       if (view.busy === "login") {
@@ -276,6 +285,8 @@ async function loadActivities() {
   const { activities, stale } = await api("/api/activities");
   // 记录取消勾选的活动，这样新发现的活动默认会被领取
   const unchecked = new Set(view.loaded ? uncheckedUrls() : readStored(UNCHECKED_KEY, []));
+  // 有条件的活动相反，默认不领，只记录用户勾选的
+  const optionalOn = new Set(view.loaded ? checkedOptionalUrls() : readStored(OPTIONAL_KEY, []));
   if (!view.loaded) view.stale = stale;
   view.loaded = true;
   const list = $("activities");
@@ -284,18 +295,20 @@ async function loadActivities() {
     const box = el("input");
     box.type = "checkbox";
     box.value = activity.url;
-    box.checked = !unchecked.has(activity.url);
+    box.checked = activity.optional ? optionalOn.has(activity.url) : !unchecked.has(activity.url);
+    if (activity.optional) box.dataset.optional = "1";
     box.addEventListener("change", () => {
       saveSelection();
       renderControls();
     });
     const label = el("label");
     label.append(box, el("span", "", activity.name || activity.url));
+    if (activity.optional) label.append(el("span", "optional-hint", activity.optional_hint));
     const row = el("li");
     row.append(label);
     list.append(row);
   }
-  $("activities-empty").hidden = activities.length > 1;
+  $("activities-empty").hidden = activities.length > 0;
   renderControls();
 }
 
@@ -329,7 +342,10 @@ async function loadAccess() {
 }
 
 function setAll(checked) {
-  for (const box of document.querySelectorAll("#activities input")) box.checked = checked;
+  for (const box of document.querySelectorAll("#activities input")) {
+    // 全选不包括有条件的活动，它们只由用户单独勾选
+    if (!checked || !box.dataset.optional) box.checked = checked;
+  }
   saveSelection();
   renderControls();
 }

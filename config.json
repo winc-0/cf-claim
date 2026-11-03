@@ -5,7 +5,7 @@
     "已领", "已签", "已完成", "未达成", "未解锁", "不可领", "明日", "即将", "敬请",
     "购买", "充值", "支付", "付费", "开通", "续费", "消费", "赠送", "兑换", "抽奖", "分享", "登录"
   ],
-  "danger_words": ["购买", "充值", "支付", "付费", "开通", "续费", "消费", "消耗", "扣除", "点券", "Q币", "兑换", "积分"],
+  "danger_words": ["购买", "充值", "支付", "付费", "开通", "续费", "消费", "消耗", "扣除", "点券", "Q币", "兑换", "换购", "积分"],
   "question_words": ["请确认", "是否", "确认要", "确定要", "确认领取", "确认选择", "确认兑换"],
   "safe_confirm_words": ["绑定的大区为"],
   "exclude_actions": ["exchange", "lott", "draw", "buy", "pay", "recharge", "gamble"],
@@ -13,20 +13,18 @@
   "bind_words": ["绑定大区", "选择大区", "请先绑定", "选择角色"],
   "dismiss_words": ["确定", "确认", "知道了", "我知道了", "关闭", "好的"],
   "closed_words": ["不在该活动开放时间", "活动已结束", "活动未开始"],
-  "load_dialog_wait_ms": 3000,
-  "result_wait_ms": 3000,
+  "optional_rules": {"网吧": "需在网吧上网，有需要再勾选"},
+  "load_dialog_wait_ms": 2000,
+  "result_wait_ms": 4000,
+  "button_wait_ms": 1000,
   "logged_in_markers": ["欢迎您", "注销"],
   "login_markers": ["亲爱的玩家，请登录", "亲，请登录", "请先登录"],
   "activity_max_age_days": 120,
   "max_clicks": 20,
-  "click_delay_ms": 2500,
-  "page_settle_ms": 3000,
+  "click_delay_ms": 1000,
+  "click_timeout_ms": 2000,
+  "page_settle_ms": 1500,
+  "discover_settle_ms": 3000,
   "captcha_wait_seconds": 120,
-  "activities": [
-    {
-      "name": "CF 官网首页",
-      "url": "https://cf.qq.com/",
-      "enabled": true
-    }
-  ]
+  "activities": []
 }

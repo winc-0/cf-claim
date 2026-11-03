@@ -11,6 +11,7 @@ run 默认在后台运行，不显示浏览器窗口；需要看到窗口时加 
 """
 
 import argparse
+import base64
 import csv
 import json
 import logging
@@ -54,8 +55,13 @@ LOGIN_URL = "https://cf.qq.com/"
 CAPTCHA_URL_MARKERS = ("captcha", "turing.")
 LOGIN_URL_MARKERS = ("ptlogin2",)
 LOGIN_SETTLE_SECONDS = 20
-QR_MISSING_RETRY_SECONDS = 20
+QR_MISSING_RETRY_SECONDS = 5
+QR_OPEN_SECONDS = 15
+# 新开的浏览器偶尔整体卡住约 20 秒，换一个比干等快。正常情况 3 秒内就能拿到二维码
+QR_BROWSER_LIMITS = (4, 5, QR_OPEN_SECONDS)
+QR_CLICK_RETRY_SECONDS = 2.5
 MAX_CONSECUTIVE_MISSES = 3
+DIALOG_POLL_MS = 200
 UNFINISHED_LOGIN_DOMAINS = ("graph.qq.com", "ptlogin2.qq.com")
 HIDDEN_WINDOW_ARGS = ["--window-position=-32000,-32000", "--window-size=1000,800"]
 # 官网登录弹窗里两种登录方式的页面结构。微信页面里有多个隐藏的二维码，所以都要限定可见
@@ -77,7 +83,25 @@ LOGIN_METHODS = {
         "expired": ".js_wx_after_cancel:visible, .js_refresh_qrcode_mask:visible, .js_refresh_qrcode:visible",
     },
 }
-ACTIVITY_URL_RE = re.compile(r"^https?://cf\.qq\.com/(?:cp|act)/[^/?#]+", re.I)
+ACTIVITY_URL_RE = re.compile(
+    r"^https?://(?:cf\.qq\.com/(?:cp|act)/|act\.daoju\.qq\.com/cp/|bb\.img\.qq\.com/bbcdn/act/cf/)[^/?#]+", re.I
+)
+OFFICIAL_HOST = "cf.qq.com"
+# 首页只放了一部分活动，“进入官网”那一页更全
+DISCOVER_PAGES = (LOGIN_URL, "https://cf.qq.com/main.shtml")
+PROBE_BATCH = 5
+PROBE_WAIT_MS = 1500
+# 新开的浏览器偶尔整体卡住约 20 秒，看不准的页面再等一轮
+PROBE_MAX_WAIT_MS = 6000
+PROBE_RETRY_WAIT_MS = 15000
+OLD_ACTIVITY_HINT = "较早的活动，可能已结束，有需要再勾选"
+OTHER_SITE_HINT = "不是 CF 官网页面，有需要再勾选"
+UNCHECKED_HINT = "没能确认这个活动能不能领，有需要再勾选"
+DATE_RANGE_RE = re.compile(
+    r"(?:(20\d{2})[.\-/年])?(\d{1,2})[.\-/月](\d{1,2})日?\.?(?:\s*\d{1,2}:\d{2}(?::\d{2})?)?"
+    r"\s*[-—–~至到]+\s*"
+    r"(?:(20\d{2})[.\-/年])?(\d{1,2})[.\-/月](\d{1,2})日?"
+)
 RESULT_WORDS = {
     "需手动处理": ("需要手动处理",),
     "成功": ("成功", "恭喜", "获得"),
@@ -180,16 +204,39 @@ DISMISS_DIALOG_JS = """
     const dialog = dialogOf(el);
     if (!dialog) continue;
     const message = clean(dialog.innerText).slice(0, 200);
+    // 弹窗可能先出框再填正文，连续两次读到相同内容才算读完
+    if (dialog.dataset.cfRead !== message) {
+      dialog.dataset.cfRead = message;
+      return {pending: true};
+    }
     let content = message;
     for (const word of [...dismissWords, '取消', '×']) content = content.split(word).join('');
     if (!clean(content)) return {message: `弹窗没有可读内容（按钮：${text}）`, blocked: true};
     const safe = safeWords.some(w => message.includes(w));
     if (stopWords.some(w => message.includes(w))) return {message, blocked: true};
     if (questionWords.some(w => message.includes(w)) && !safe) return {message, blocked: true};
+    delete dialog.dataset.cfRead;
     el.click();
     return {message, blocked: false};
   }
   return null;
+}
+"""
+
+# 放大后再导出，二维码在页面上才足够清晰。图片加载中返回 null，不是图片或读不到时返回空字符串
+QR_IMAGE_JS = """
+el => {
+  if (el.tagName !== 'IMG' || !el.getAttribute('src')) return '';
+  if (!el.complete) return null;
+  if (!el.naturalWidth) return '';
+  const scale = Math.ceil(480 / el.naturalWidth);
+  const canvas = document.createElement('canvas');
+  canvas.width = el.naturalWidth * scale;
+  canvas.height = el.naturalHeight * scale;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(el, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL('image/png').split(',')[1];
 }
 """
 
@@ -373,26 +420,128 @@ def save_claimed(claimed):
             writer.writerow([entry["time"], entry["activity"], entry["item"], entry["source"]])
 
 
-def discover_activities(page, config, url=LOGIN_URL):
-    """从官网页面收集活动页链接，只保留 cf.qq.com 下的 cp 和 act 页面。"""
-    page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(config.get("page_settle_ms", 3000))
-    danger = config.get("danger_words", [])
-    found = {}
-    for link in page.evaluate(LIST_LINKS_JS):
-        href = urljoin(url, link["href"])
-        if not ACTIVITY_URL_RE.match(href) or any(w in link["text"] for w in danger):
+def open_with_retry(page, url):
+    """官网偶尔连接被断开，多试一次通常就好。"""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    except PlaywrightError:
+        page.wait_for_timeout(1000)
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+
+def activity_ended(text, url, today=None):
+    """页面上写的活动时间全部已过才算结束。写法不规范或看不出来的都算没结束，运行时还会再判断。"""
+    today = today or date.today()
+    match = ACTIVITY_DATE_RE.search(url)
+    url_year = int(match.group(1)) if match else None
+    ends = []
+    for start_year, start_month, start_day, end_year, end_month, end_day in DATE_RANGE_RE.findall(text):
+        year = int(end_year or start_year or url_year or 0)
+        if not year:
             continue
-        parts = urlsplit(href)
-        clean = f"https://{parts.netloc}{parts.path}"
-        # 同一活动可能带或不带 index 文件名，按目录去重
-        key = re.sub(r"/index\.s?html?$", "/", clean)
-        if key not in found or (link["text"] and not found[key]["name"]):
-            found[key] = {"name": link["text"], "url": clean}
+        try:
+            end = date(year, int(end_month), int(end_day))
+            # 没写年份又跨年
+            if not end_year and (int(end_month), int(end_day)) < (int(start_month), int(start_day)):
+                end = date(year + 1, int(end_month), int(end_day))
+        except ValueError:
+            continue
+        ends.append(end)
+    return bool(ends) and max(ends) < today
+
+
+def check_activity_page(page, item, config):
+    """返回页面上有没有能领的活动。没打开或没加载完时看不准，返回 None。"""
+    try:
+        # 打不开时停在空白页或浏览器的错误页，上面当然没有按钮
+        if not page.url.startswith("http") or page.evaluate("document.readyState") == "loading":
+            return None
+        if activity_ended(page.evaluate("document.body ? document.body.innerText : ''"), item["url"]):
+            return False
+        return any(find_buttons(f, config["claim_words"], config["exclude_words"], False, config) for f in safe_frames(page))
+    except PlaywrightError:
+        return None
+
+
+def probe_batch(context, items, config, max_wait_ms):
+    """同时打开一批活动页，等到都看得准或超时。返回每一页的判断结果。"""
+    pages = []
+    for item in items:
+        probe = context.new_page()
+        pages.append(probe)
+        try:
+            probe.goto(item["url"], wait_until="commit", timeout=10000)
+        except PlaywrightError:
+            pass
+    deadline = time.monotonic() + max_wait_ms / 1000
+    pages[-1].wait_for_timeout(min(PROBE_WAIT_MS, max_wait_ms))
+    while True:
+        results = [check_activity_page(probe, item, config) for item, probe in zip(items, pages)]
+        if None not in results or time.monotonic() >= deadline:
+            break
+        pages[-1].wait_for_timeout(500)
+    for item, probe, result in zip(items, pages, results):
+        # 有些链接是图片，没有文字，用页面标题当名称
+        if result and item["name"].startswith("/"):
+            item["name"] = re.split(r"[-_]", probe.title())[0] or item["name"]
+        probe.close()
+    return results
+
+
+def probe_activities(context, items, config):
+    """打开每个活动页看一眼，去掉版本介绍、专题站这类没有领取按钮的页面和已结束的活动。只看不点。"""
+    kept = []
+    unknown = []
+    for start in range(0, len(items), PROBE_BATCH):
+        batch = items[start:start + PROBE_BATCH]
+        for item, result in zip(batch, probe_batch(context, batch, config, PROBE_MAX_WAIT_MS)):
+            if result:
+                kept.append(item)
+            elif result is None:
+                unknown.append(item)
+    if unknown:
+        for item, result in zip(unknown, probe_batch(context, unknown, config, PROBE_RETRY_WAIT_MS)):
+            if result:
+                kept.append(item)
+            elif result is None:
+                # 不确定的活动不能默认点击，但也不能让它从列表里消失
+                kept.append({**item, "unchecked": True})
+    return kept
+
+
+def discover_activities(page, config):
+    """从官网收集活动页链接，再去掉用不上的页面。"""
+    danger = config.get("danger_words", [])
+    max_age = config.get("activity_max_age_days", DEFAULT_ACTIVITY_MAX_AGE_DAYS)
+    found = {}
+    errors = []
+    for url in DISCOVER_PAGES:
+        try:
+            open_with_retry(page, url)
+        except PlaywrightError as e:
+            errors.append(e)
+            continue
+        # 活动链接由脚本生成，比活动页的按钮出现得晚
+        page.wait_for_timeout(config.get("discover_settle_ms", 3000))
+        for link in page.evaluate(LIST_LINKS_JS):
+            href = urljoin(url, link["href"])
+            if not ACTIVITY_URL_RE.match(href) or any(w in link["text"] for w in danger):
+                continue
+            # 官网页上较早的链接基本是客服、资料这类固定入口；只有首页还挂着的才可能是长期活动
+            if url != LOGIN_URL and not is_recent_activity(href, max_age):
+                continue
+            parts = urlsplit(href)
+            clean = f"https://{parts.netloc}{parts.path}"
+            # 同一活动可能带或不带 index 文件名，按目录去重
+            key = re.sub(r"/index\.s?html?$", "/", clean)
+            text = re.split(r"\s*(?:活动|版本)时间", link["text"])[0]
+            if key not in found or (text and not found[key]["name"]):
+                found[key] = {"name": text, "url": clean}
+    if len(errors) == len(DISCOVER_PAGES):
+        raise errors[0]
     for item in found.values():
         item["name"] = item["name"] or urlsplit(item["url"]).path
-    max_age = config.get("activity_max_age_days", DEFAULT_ACTIVITY_MAX_AGE_DAYS)
-    return [item for item in found.values() if is_recent_activity(item["url"], max_age)]
+    return probe_activities(page.context, list(found.values()), config)
 
 
 def is_recent_activity(url, max_age_days, today=None):
@@ -412,6 +561,24 @@ def merge_activities(configured, discovered):
     known = {a["url"].rstrip("/") for a in configured}
     enabled = [a for a in configured if a.get("enabled", True)]
     return enabled + [a for a in discovered if a["url"].rstrip("/") not in known]
+
+
+def is_official(url):
+    return urlsplit(url).netloc == OFFICIAL_HOST
+
+
+def optional_hint(activity, config):
+    """不默认领取的活动返回原因，由用户自己决定是否勾选：有线下条件的、不是官网页面的、较早的。"""
+    for word, hint in config.get("optional_rules", {}).items():
+        if word in activity.get("name", ""):
+            return hint
+    if activity.get("unchecked"):
+        return UNCHECKED_HINT
+    if not is_official(activity["url"]):
+        return OTHER_SITE_HINT
+    if not is_recent_activity(activity["url"], config.get("activity_max_age_days", DEFAULT_ACTIVITY_MAX_AGE_DAYS)):
+        return OLD_ACTIVITY_HINT
+    return ""
 
 
 def safe_frames(page):
@@ -488,7 +655,7 @@ def dismiss_page_dialogs(page, config, messages):
         "questionWords": config.get("question_words", []),
         "safeWords": config.get("safe_confirm_words", []),
     }
-    for _ in range(3):
+    for _ in range(6):
         result = None
         for frame in safe_frames(page):
             try:
@@ -499,6 +666,9 @@ def dismiss_page_dialogs(page, config, messages):
                 break
         if not result:
             return True
+        if result.get("pending"):
+            page.wait_for_timeout(DIALOG_POLL_MS)
+            continue
         if result["blocked"]:
             log.warning("  弹窗需要手动处理，已停止本活动: %s", result["message"])
             messages.append(f"需要手动处理：{result['message']}")
@@ -508,20 +678,20 @@ def dismiss_page_dialogs(page, config, messages):
     return True
 
 
-def wait_for_page_dialog(page, config, messages, timeout_ms):
-    """弹窗常常晚于点击出现，等到出现一个或超时为止。遇到需要人工处理的弹窗时返回 False。"""
+def wait_for_page_dialog(page, config, messages, timeout_ms, min_ms=0):
+    """弹窗常常晚于点击出现，看到结果就返回，最多等 timeout_ms，至少等 min_ms。遇到需要人工处理的弹窗时返回 False。"""
     # 大区确认只是过场，真正的结果在它之后才弹出来
     safe_words = config.get("safe_confirm_words", [])
     results = lambda: sum(not any(w in m for w in safe_words) for m in messages)  # noqa: E731
     seen = results()
-    waited = 0
+    started = time.monotonic()
     while True:
         if not dismiss_page_dialogs(page, config, messages):
             return False
-        if results() > seen or waited >= timeout_ms:
+        waited = (time.monotonic() - started) * 1000
+        if (results() > seen and waited >= min_ms) or waited >= timeout_ms:
             return True
-        page.wait_for_timeout(500)
-        waited += 500
+        page.wait_for_timeout(DIALOG_POLL_MS)
 
 
 def find_buttons(frame, claim_words, exclude_words, mark_first, config):
@@ -540,7 +710,18 @@ def find_buttons(frame, claim_words, exclude_words, mark_first, config):
         return []
 
 
-def click_next(page, claim_words, exclude_words, delay_ms, config):
+def wait_for_buttons(page, claim_words, exclude_words, config):
+    """按钮可能晚一点才出现，比如领完一个才解锁下一个。"""
+    deadline = time.monotonic() + config.get("button_wait_ms", 1000) / 1000
+    while True:
+        if any(find_buttons(f, claim_words, exclude_words, False, config) for f in safe_frames(page)):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        page.wait_for_timeout(DIALOG_POLL_MS)
+
+
+def click_next(page, claim_words, exclude_words, config):
     """点击下一个未处理的按钮，返回 (按钮文字, 是否点中)；没有按钮时文字为 None。"""
     for frame in safe_frames(page):
         found = find_buttons(frame, claim_words, exclude_words, True, config)
@@ -549,7 +730,7 @@ def click_next(page, claim_words, exclude_words, delay_ms, config):
         target = frame.locator("[data-cf-target]").first
         clicked = True
         try:
-            target.click(timeout=5000)
+            target.click(timeout=config.get("click_timeout_ms", 2000))
         except PlaywrightTimeout:
             clicked = False
         except PlaywrightError:
@@ -565,7 +746,6 @@ def click_next(page, claim_words, exclude_words, delay_ms, config):
             frame.evaluate(finish, clicked)
         except PlaywrightError:
             pass
-        page.wait_for_timeout(delay_ms)
         return found[0], clicked
     return None, False
 
@@ -577,13 +757,23 @@ def process_activity(page, activity, config, dry_run, headless, stats=None, clai
     claim_words = activity.get("claim_words", config["claim_words"])
     exclude_words = config["exclude_words"] + activity.get("exclude_words", [])
     max_clicks = activity.get("max_clicks", config.get("max_clicks", 20))
-    delay_ms = config.get("click_delay_ms", 2500)
+    min_interval = config.get("click_delay_ms", 1000)
     captcha_text = "遇到验证码，后台无法处理。请勾选显示浏览器窗口后重试，并在电脑上手动完成"
 
     log.info("活动: %s", name)
     page.goto(activity["url"], wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(config.get("page_settle_ms", 3000))
+    page.wait_for_timeout(config.get("page_settle_ms", 1500))
 
+    if needs_login(page, config) and not is_official(activity["url"]):
+        # 官网以外的页面有自己的登录状态，不代表已保存的登录失效了
+        log.warning("  这个页面需要单独登录，已跳过")
+        emit("notice", level="error", text=f"{name}：这个页面需要单独登录，已跳过")
+        return "failed"
+    if needs_login(page, config) and not is_official(activity["url"]):
+        # 官网以外的页面有自己的登录状态，不代表已保存的登录失效了
+        log.warning("  这个页面需要单独登录，已跳过")
+        emit("notice", level="error", text=f"{name}：这个页面需要单独登录，已跳过")
+        return "failed"
     if needs_login(page, config):
         log.error("  未登录或登录已失效，请重新登录")
         emit("notice", level="error", text="未登录或登录已失效，请重新登录")
@@ -652,7 +842,7 @@ def process_activity(page, activity, config, dry_run, headless, stats=None, clai
     closed = False
     try:
         # 有些页面加载后才弹窗，会挡住后面的按钮
-        if not wait_for_page_dialog(page, config, messages, config.get("load_dialog_wait_ms", 3000)):
+        if not wait_for_page_dialog(page, config, messages, config.get("load_dialog_wait_ms", 2000)):
             status = "needs_manual"
             attempts = max_clicks
         elif any(w in msg for msg in messages for w in config.get("closed_words", [])):
@@ -665,7 +855,9 @@ def process_activity(page, activity, config, dry_run, headless, stats=None, clai
             if should_stop and should_stop():
                 status = "stopped"
                 break
-            text, clicked = click_next(page, claim_words, exclude_words, delay_ms, config)
+            if not wait_for_buttons(page, claim_words, exclude_words, config):
+                break
+            text, clicked = click_next(page, claim_words, exclude_words, config)
             if text is None:
                 break
             attempts += 1
@@ -684,12 +876,17 @@ def process_activity(page, activity, config, dry_run, headless, stats=None, clai
                 emit("notice", level="error", text=f"{name}：连续点不中按钮，已停止本活动")
                 status = "failed"
                 break
+            result_wait = config.get("result_wait_ms", 4000) if clicked else 0
+            if not wait_for_page_dialog(page, config, messages, result_wait, min_interval if clicked else 0):
+                status = "needs_manual"
+                break
+            # 验证码也晚于点击出现，要在等完结果后再检查；手动过完验证码后结果才会弹出来
+            solving = has_captcha(page)
             if not wait_for_captcha(page, config, headless):
                 emit("notice", level="error", text=captcha_text)
                 status = "failed"
                 break
-            result_wait = config.get("result_wait_ms", 3000) if clicked else 0
-            if not wait_for_page_dialog(page, config, messages, result_wait):
+            if solving and not wait_for_page_dialog(page, config, messages, result_wait):
                 status = "needs_manual"
                 break
             report_progress()
@@ -772,16 +969,52 @@ def cmd_login(config, emit=no_emit, auto_close=False, should_stop=None, timeout_
     return 0
 
 
-def open_qr_page(page, method):
-    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(1000)
-    page.locator("#dologin").click(timeout=15000)
+def page_scripts_loaded(page):
+    try:
+        return page.evaluate("document.readyState") != "loading"
+    except PlaywrightError:
+        return False
+
+
+def open_qr_page(page, method, should_stop=None, limit=None):
+    """打开登录框并等二维码出现，返回是否等到了。页面脚本加载完之前点登录没有反应，所以等它们加载完再点，没出来就再点。"""
     tab = LOGIN_METHODS[method]["tab"]
-    if tab:
-        try:
-            page.locator(tab).first.click(timeout=10000)
-        except PlaywrightError:
-            pass  # 没有切换入口时，后面找不到二维码会走重试
+    deadline = time.monotonic() + (limit or QR_OPEN_SECONDS)
+    try:
+        page.goto(LOGIN_URL, wait_until="commit", timeout=int((limit or QR_OPEN_SECONDS) * 1000))
+    except PlaywrightError:
+        return False  # 打不开时后面找不到二维码会走重试
+    retry_at = 0
+    while time.monotonic() < deadline and not (should_stop and should_stop()):
+        if find_qr_frame(page, method):
+            return True
+        if time.monotonic() >= retry_at and page_scripts_loaded(page):
+            # 切换入口要等登录框打开才出现，出现后马上点
+            target = tab if tab and is_visible(page.main_frame, tab) else "#dologin"
+            try:
+                page.locator(target).first.click(timeout=800)
+            except PlaywrightError:
+                pass
+            retry_at = 0 if target != tab and tab else time.monotonic() + QR_CLICK_RETRY_SECONDS
+        page.wait_for_timeout(100)
+    return False
+
+
+def read_qr(frame, selector):
+    """取二维码图片。屏幕外的窗口截一次图要好几秒，所以直接读图片内容，读不到才截图。图片还没加载完时返回 None。"""
+    qr = frame.locator(selector).first
+    try:
+        data = qr.evaluate(QR_IMAGE_JS)
+    except PlaywrightError:
+        data = ""
+    if data:
+        return base64.b64decode(data)
+    if data is None:
+        return None
+    try:
+        return qr.screenshot(timeout=3000)
+    except PlaywrightError:
+        return None
 
 
 def is_visible(frame, selector):
@@ -802,12 +1035,13 @@ def find_qr_frame(page, method):
     return None
 
 
-def run_qr_login(page, emit, on_qr, should_stop=None, deadline=None, poll_ms=1000, missing_retry=QR_MISSING_RETRY_SECONDS, method="qq"):
+def run_qr_login(page, emit, on_qr, should_stop=None, deadline=None, poll_ms=1000, missing_retry=QR_MISSING_RETRY_SECONDS, method="qq", opened=False):
     """在后台打开官方登录页，把二维码交给 on_qr，等手机扫码确认。返回是否登录成功。"""
     selectors = LOGIN_METHODS[method]
     context = page.context
-    context.clear_cookies()
-    open_qr_page(page, method)
+    if not opened:
+        context.clear_cookies()
+        open_qr_page(page, method, should_stop)
     last_png = None
     version = 0
     scanned = False
@@ -822,17 +1056,14 @@ def run_qr_login(page, emit, on_qr, should_stop=None, deadline=None, poll_ms=100
             missing_since = time.time()
             if is_visible(frame, selectors["expired"]):
                 emit("notice", level="info", text="二维码已失效，正在刷新")
-                open_qr_page(page, method)
+                open_qr_page(page, method, should_stop)
                 last_png = None
                 scanned = False
                 continue
             if is_visible(frame, selectors["scanned"]) and not scanned:
                 scanned = True
                 emit("login_scanned")
-            try:
-                png = frame.locator(selectors["qr"]).first.screenshot(timeout=3000)
-            except PlaywrightError:
-                png = None
+            png = read_qr(frame, selectors["qr"])
             if png and png != last_png:
                 last_png = png
                 version += 1
@@ -840,7 +1071,7 @@ def run_qr_login(page, emit, on_qr, should_stop=None, deadline=None, poll_ms=100
                 emit("login_qr", version=version, method=method)
         elif scanned and is_visible_anywhere(page, selectors["expired"]):
             emit("notice", level="info", text="这次登录已取消，正在刷新二维码")
-            open_qr_page(page, method)
+            open_qr_page(page, method, should_stop)
             last_png = None
             scanned = False
         elif not scanned and time.time() - missing_since > missing_retry:
@@ -848,9 +1079,10 @@ def run_qr_login(page, emit, on_qr, should_stop=None, deadline=None, poll_ms=100
             if retries > 2:
                 emit("notice", level="error", text="取不到登录二维码，可以改用电脑上的登录窗口")
                 return False
-            open_qr_page(page, method)
+            open_qr_page(page, method, should_stop)
             missing_since = time.time()
-        page.wait_for_timeout(poll_ms)
+        # 第一张二维码出来之前查得勤一些
+        page.wait_for_timeout(poll_ms if last_png else min(poll_ms, DIALOG_POLL_MS))
     return False
 
 
@@ -860,12 +1092,18 @@ def cmd_qr_login(config, emit=no_emit, on_qr=None, should_stop=None, timeout_sec
     with sync_playwright() as p:
         # 放大截图，二维码在手机上才足够清晰
         hidden_window = LOGIN_METHODS[method].get("hidden_window", False)
-        context = open_context(
-            p, config, headless=not hidden_window, restore_auth=False, device_scale_factor=4, hidden_window=hidden_window
-        )
-        page = context.pages[0] if context.pages else context.new_page()
+        for limit in QR_BROWSER_LIMITS:
+            context = open_context(
+                p, config, headless=not hidden_window, restore_auth=False, device_scale_factor=4, hidden_window=hidden_window
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            context.clear_cookies()
+            if open_qr_page(page, method, should_stop, limit) or limit == QR_BROWSER_LIMITS[-1] or (should_stop and should_stop()):
+                break
+            context.close()
+            emit("login_slow")
         try:
-            saved = run_qr_login(page, emit, on_qr or (lambda png: None), should_stop, deadline, method=method)
+            saved = run_qr_login(page, emit, on_qr or (lambda png: None), should_stop, deadline, method=method, opened=True)
         finally:
             context.close()
     if saved:
@@ -920,6 +1158,8 @@ def cmd_run(config, dry_run, headless, discover=False, only=None, activities=Non
             activities = merge_activities(configured, discovered)
             if only:
                 activities = [a for a in activities if only in a.get("name", "") or only in a["url"]]
+            else:
+                activities = [a for a in activities if not optional_hint(a, config)]
         if not activities:
             log.error("没有可处理的活动")
             emit("notice", level="error", text="没有可处理的活动")

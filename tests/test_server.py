@@ -24,6 +24,7 @@ URL_B = "https://cf.qq.com/cp/b/"
 class FakeEngine:
     ITEMS_FILE = None
     merge_activities = staticmethod(cf_claim.merge_activities)
+    optional_hint = staticmethod(cf_claim.optional_hint)
     LOGIN_METHODS = cf_claim.LOGIN_METHODS
 
     def __init__(self):
@@ -247,6 +248,11 @@ class ServerTest(unittest.TestCase):
         for method in ("alipay", 1, None):
             self.assertEqual(self.request("POST", "/api/login", {"method": method})[0].status, 400, method)
         self.assertEqual(self.engine.calls, [])
+
+    def test_activities_report_optional(self):
+        self.app.config.update(optional_rules={"网吧": "说明"}, activities=[{"name": "网吧福利", "url": URL_A}, {"name": "B", "url": URL_B}])
+        data = json.loads(self.request("GET", "/api/activities")[1])["activities"]
+        self.assertEqual([(a["optional"], a["optional_hint"]) for a in data], [(True, "说明"), (False, "")])
 
     def test_activities_report_staleness(self):
         data = json.loads(self.request("GET", "/api/activities")[1])

@@ -118,7 +118,9 @@ class App:
             return []
 
     def activities(self):
-        return self.engine.merge_activities(self.config.get("activities", []), self.discovered)
+        merged = self.engine.merge_activities(self.config.get("activities", []), self.discovered)
+        hints = [self.engine.optional_hint(a, self.config) for a in merged]
+        return [{**a, "optional": bool(h), "optional_hint": h} for a, h in zip(merged, hints)]
 
     def activities_stale(self):
         try:

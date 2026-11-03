@@ -8,7 +8,7 @@ import unittest
 from collections import Counter
 from datetime import date
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -267,6 +267,125 @@ class BrowserTest(unittest.TestCase):
         self.assertNotIn("", self.page.evaluate("window.confirmed"))
         self.assertEqual(self.page.locator(".amsdialog_modal").count(), 1)  # 空白弹窗留在页面上，没有被点掉
 
+    def test_dialog_text_filled_late_is_read_in_full(self):
+        self.page.set_content(
+            """<div class="amsdialog_modal" style="position:fixed"><p id="body">领取结果</p>
+               <a href="javascript:;" onclick="window.confirmed = true">确认</a></div>"""
+        )
+        args = {
+            "dismissWords": self.config["dismiss_words"],
+            "stopWords": cf_claim.stop_words(self.config),
+            "questionWords": self.config["question_words"],
+            "safeWords": self.config["safe_confirm_words"],
+        }
+        read = lambda: self.page.evaluate(cf_claim.DISMISS_DIALOG_JS, args)  # noqa: E731
+        self.assertTrue(read().get("pending"))  # 第一次读到的可能只是还没填完的内容，不能点
+        self.page.evaluate("document.getElementById('body').innerText = '领取结果：本次将消耗积分'")
+        self.assertTrue(read().get("pending"))  # 内容变了，要再读一次
+        result = read()
+        self.assertTrue(result["blocked"])
+        self.assertIn("消耗积分", result["message"])
+        self.assertIsNone(self.page.evaluate("window.confirmed ?? null"))
+
+    def show_result_dialog(self):
+        self.page.set_content(
+            """<div class="amsdialog_modal" style="position:fixed"><p>恭喜您获得了礼包：道具</p>
+               <a href="javascript:;" onclick="this.parentNode.remove()">确认</a></div>"""
+        )
+
+    def test_result_dialog_ends_wait_early(self):
+        self.show_result_dialog()
+        messages = []
+        started = time.monotonic()
+        self.assertTrue(cf_claim.wait_for_page_dialog(self.page, self.config, messages, 10000))
+        self.assertEqual(len(messages), 1)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_clicks_keep_minimum_interval(self):
+        self.show_result_dialog()
+        started = time.monotonic()
+        self.assertTrue(cf_claim.wait_for_page_dialog(self.page, self.config, [], 10000, min_ms=1500))
+        self.assertGreaterEqual(time.monotonic() - started, 1.5)
+
+    def test_button_appearing_late_is_found(self):
+        self.config.update(button_wait_ms=3000)
+        self.page.set_content(
+            """<div id="box"></div>
+               <script>setTimeout(() => { document.getElementById('box').innerHTML = '<a href="javascript:;">领取</a>'; }, 300);</script>"""
+        )
+        self.assertTrue(cf_claim.wait_for_buttons(self.page, ["领取"], [], self.config))
+
+    def test_no_button_ends_wait(self):
+        self.config.update(button_wait_ms=100)
+        self.page.set_content("<p>没有按钮</p>")
+        self.assertFalse(cf_claim.wait_for_buttons(self.page, ["领取"], [], self.config))
+
+    def test_optional_activities(self):
+        recent = f"https://cf.qq.com/cp/a{date.today():%Y%m%d}x/"
+        hint = lambda name, url=recent: cf_claim.optional_hint({"name": name, "url": url}, self.config)  # noqa: E731
+        self.assertIn("网吧", hint("11月网吧福利 稀有套装限时领取"))
+        self.assertEqual(hint("11月灵狐的约定"), "")
+        self.assertEqual(hint("冬季幸运礼", "https://act.daoju.qq.com/cp/a20261110x/"), cf_claim.OTHER_SITE_HINT)
+        self.assertEqual(hint("英雄计划", "https://cf.qq.com/cp/a20200702x/"), cf_claim.OLD_ACTIVITY_HINT)
+
+    def test_other_site_asking_for_login_does_not_invalidate_saved_login(self):
+        self.context.route(
+            "https://act.daoju.qq.com/**",
+            lambda route: route.fulfill(status=200, body="<p>请先登录</p>", content_type="text/html; charset=utf-8"),
+        )
+        activity = {"url": "https://act.daoju.qq.com/cp/a/", "name": "道聚城"}
+        status = cf_claim.process_activity(self.page, activity, self.config, False, True)
+        self.assertEqual(status, "failed")
+
+    def test_discovery_covers_main_page_and_drops_useless_pages(self):
+        today = date.today()
+        fresh = f"a{today:%Y%m%d}"
+        future = f"{today.year + 1}.1.1"
+        button = '<a href="javascript:;">领取</a>'
+        pages = {
+            "/": f'<a href="/cp/{fresh}home/">首页活动</a><a href="/cp/a20200101hero/">长期活动</a>',
+            "/main.shtml": (
+                f'<a href="/cp/{fresh}main/">官网页活动 活动时间：2026-11-01 - 2026-11-30</a>'
+                f'<a href="/cp/{fresh}info/">版本介绍</a><a href="/cp/{fresh}over/">已结束</a>'
+                f'<a href="/cp/{fresh}buy/">VVIP换购</a><a href="/cp/a20200101safe/">安全站</a>'
+                '<a href="https://example.com/cp/a/">外站</a>'
+            ),
+            f"/cp/{fresh}home/": f"活动时间：2026.1.1 - {future} {button}",
+            "/cp/a20200101hero/": button,
+            f"/cp/{fresh}main/": button,
+            f"/cp/{fresh}info/": "<p>版本介绍</p>",
+            f"/cp/{fresh}over/": f"活动时间：2020.1.1 - 2020.2.1 {button}",
+        }
+
+        def handle(route):
+            body = pages.get(urlsplit(route.request.url).path, "")
+            route.fulfill(status=200, body=f'<meta charset="utf-8">{body}', content_type="text/html; charset=utf-8")
+
+        self.context.route("https://cf.qq.com/**", handle)
+        self.config.update(discover_settle_ms=0)
+        found = {a["url"].split("/cp/")[1]: a["name"] for a in cf_claim.discover_activities(self.page, self.config)}
+        self.assertEqual(found, {f"{fresh}home/": "首页活动", "a20200101hero/": "长期活动", f"{fresh}main/": "官网页活动"})
+
+    def test_page_that_cannot_be_checked_stays_listed_but_is_not_selected(self):
+        self.context.route("https://cf.qq.com/**", lambda route: route.abort())
+        wait = cf_claim.PROBE_MAX_WAIT_MS, cf_claim.PROBE_RETRY_WAIT_MS
+        cf_claim.PROBE_MAX_WAIT_MS = cf_claim.PROBE_RETRY_WAIT_MS = 100
+        self.addCleanup(lambda: (setattr(cf_claim, "PROBE_MAX_WAIT_MS", wait[0]), setattr(cf_claim, "PROBE_RETRY_WAIT_MS", wait[1])))
+        item = {"name": "卡住的活动", "url": f"https://cf.qq.com/cp/a{date.today():%Y%m%d}x/"}
+        kept = cf_claim.probe_activities(self.context, [item], self.config)
+        self.assertEqual([a["name"] for a in kept], ["卡住的活动"])
+        self.assertEqual(cf_claim.optional_hint(kept[0], self.config), cf_claim.UNCHECKED_HINT)
+
+    def test_activity_end_date(self):
+        ended = lambda text, url="https://cf.qq.com/cp/a20261001x/": cf_claim.activity_ended(text, url, date(2026, 11, 3))  # noqa: E731
+        self.assertTrue(ended("活动时间：2026.8.8 00:00- 2026.9.6 23:59"))
+        self.assertTrue(ended("9月8日-10月19日"))  # 没写年份时用网址里的年份
+        self.assertFalse(ended("2026.10.13.—2026.12.10"))
+        self.assertFalse(ended("2026.8.8-2026.9.6 第二阶段 2026.11.1-2026.11.30"))  # 还有没结束的阶段
+        self.assertFalse(ended("12月20日-1月10日"))  # 跨年
+        self.assertFalse(ended("没有写时间"))
+        self.assertFalse(ended("9月8日-10月19日", "https://bb.img.qq.com/bbcdn/act/cf/a261101x/"))  # 看不出年份不算结束
+
     def test_repeated_misses_stop_activity(self):
         self.config.update(load_dialog_wait_ms=0, result_wait_ms=0)
         status, _, clicks = self.run_page("ams.html", "?mode=blocked")
@@ -386,6 +505,35 @@ class QrLoginTest(unittest.TestCase):
         emit = lambda kind, **fields: self.events.append((kind, fields))  # noqa: E731
         return cf_claim.run_qr_login(self.page, emit, self.qrs.append, poll_ms=150, **kwargs)
 
+    def test_real_qr_image_is_read_without_screenshot(self):
+        png = (
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/AAAMA"
+            "BAEBAG2pCmoAAAAASUVORK5CYII="
+        )
+        self.page.set_content(f'<img id="qr" src="{png}" style="width:90px;height:90px">')
+        self.page.wait_for_function("document.getElementById('qr').complete")
+        data = cf_claim.read_qr(self.page.main_frame, "#qr")
+        self.assertTrue(data.startswith(b"\x89PNG"))
+        size = int.from_bytes(data[16:20], "big")
+        self.assertEqual(size, 480)  # 小图放大后再上报
+
+    def test_loading_qr_image_is_not_reported(self):
+        self.context.route("https://example.test/**", lambda route: None)  # 一直不返回，图片保持加载中
+        self.page.set_content('<img id="qr" src="https://example.test/qr" style="width:90px;height:90px">', wait_until="commit")
+        self.assertIsNone(cf_claim.read_qr(self.page.main_frame, "#qr"))
+
+    def test_login_click_is_repeated_until_qr_appears(self):
+        self.serve("ok")
+        html = (PAGES / "login.html").read_text(encoding="utf-8")
+        # 登录脚本晚 800 毫秒才绑定，之前的点击都没有反应
+        html = html.replace('onclick="start()"', 'onclick="window.ready && start()"').replace(
+            "<script>", "<script>window.__MODE = 'ok'; setTimeout(() => { window.ready = true; }, 800);", 1
+        )
+        self.context.unroute("https://cf.qq.com/**")
+        self.context.route("https://cf.qq.com/**", lambda route: route.fulfill(status=200, body=html, content_type="text/html; charset=utf-8"))
+        self.assertTrue(self.login(deadline=time.time() + 20))
+        self.assertTrue(self.qrs)
+
     def test_waits_for_access_token_before_saving(self):
         self.serve("ok")
         self.assertTrue(self.login(deadline=time.time() + 20))
@@ -435,6 +583,9 @@ class QrLoginTest(unittest.TestCase):
 
     def test_gives_up_when_qr_never_appears(self):
         self.context.route("https://cf.qq.com/**", lambda route: route.fulfill(status=200, body='<a id="dologin">登录</a>', content_type="text/html; charset=utf-8"))
+        limit = cf_claim.QR_OPEN_SECONDS
+        cf_claim.QR_OPEN_SECONDS = 0.5
+        self.addCleanup(setattr, cf_claim, "QR_OPEN_SECONDS", limit)
         self.assertFalse(self.login(deadline=time.time() + 15, missing_retry=0.2))
         self.assertTrue(any("取不到登录二维码" in f.get("text", "") for k, f in self.events if k == "notice"))
 
