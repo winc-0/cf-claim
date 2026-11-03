@@ -14,10 +14,12 @@ import argparse
 import csv
 import json
 import logging
+import os
 import re
 import sys
 import time
 from collections import Counter
+from datetime import date
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
 
@@ -25,11 +27,28 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
-BASE_DIR = Path(__file__).resolve().parent
-PROFILE_DIR = BASE_DIR / "browser_profile"
-LOG_FILE = BASE_DIR / "claim.log"
-AUTH_FILE = BASE_DIR / "auth_cookies.json"
-ITEMS_FILE = BASE_DIR / "claimed_items.csv"
+# 打包后程序文件是只读的，资源在解压目录，账号和记录放到用户目录
+FROZEN = getattr(sys, "frozen", False)
+BASE_DIR = Path(sys._MEIPASS) if FROZEN else Path(__file__).resolve().parent
+
+
+def find_data_dir():
+    override = os.environ.get("CF_CLAIM_DATA_DIR")
+    if override:
+        path = Path(override)
+    elif FROZEN:
+        path = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "CFClaim"
+    else:
+        return BASE_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+DATA_DIR = find_data_dir()
+PROFILE_DIR = DATA_DIR / "browser_profile"
+LOG_FILE = DATA_DIR / "claim.log"
+AUTH_FILE = DATA_DIR / "auth_cookies.json"
+ITEMS_FILE = DATA_DIR / "claimed_items.csv"
 LOGIN_URL = "https://cf.qq.com/"
 
 CAPTCHA_URL_MARKERS = ("captcha", "turing.")
@@ -37,6 +56,27 @@ LOGIN_URL_MARKERS = ("ptlogin2",)
 LOGIN_SETTLE_SECONDS = 20
 QR_MISSING_RETRY_SECONDS = 20
 MAX_CONSECUTIVE_MISSES = 3
+UNFINISHED_LOGIN_DOMAINS = ("graph.qq.com", "ptlogin2.qq.com")
+HIDDEN_WINDOW_ARGS = ["--window-position=-32000,-32000", "--window-size=1000,800"]
+# 官网登录弹窗里两种登录方式的页面结构。微信页面里有多个隐藏的二维码，所以都要限定可见
+LOGIN_METHODS = {
+    "qq": {
+        "name": "QQ",
+        "tab": None,  # 弹窗默认就是 QQ 二维码
+        # 实测无窗口模式生成的二维码扫码后跳到下载页，只有真实窗口成功过，所以用移到屏幕外的窗口
+        "hidden_window": True,
+        "qr": "#qrlogin_img:visible",
+        "scanned": "#qrlogin_step2:visible",
+        "expired": "#qr_invalid:visible",
+    },
+    "wechat": {
+        "name": "微信",
+        "tab": "a.wx-tab",
+        "qr": "img.js_qrcode_img:visible",
+        "scanned": ".js_wx_after_scan:visible",
+        "expired": ".js_wx_after_cancel:visible, .js_refresh_qrcode_mask:visible, .js_refresh_qrcode:visible",
+    },
+}
 ACTIVITY_URL_RE = re.compile(r"^https?://cf\.qq\.com/(?:cp|act)/[^/?#]+", re.I)
 RESULT_WORDS = {
     "需手动处理": ("需要手动处理",),
@@ -45,7 +85,15 @@ RESULT_WORDS = {
     "未开放或不满足条件": ("不在", "未开始", "已结束", "未开放", "将于", "敬请期待", "不满足", "未达到", "没有资格", "不符合"),
 }
 
+ACTIVITY_DATE_RE = re.compile(r"/a(20\d{2})(\d{2})(\d{2})")
+DEFAULT_ACTIVITY_MAX_AGE_DAYS = 120
+BROWSER_CHANNELS = ("chrome", "msedge")
+
 log = logging.getLogger("cf_claim")
+
+
+class BrowserNotFound(Exception):
+    """电脑上没有可用的 Chrome 或 Edge。"""
 
 
 def no_emit(kind, **fields):
@@ -153,36 +201,63 @@ LIST_LINKS_JS = """
 """
 
 
+def config_path():
+    """用户目录里有 config.json 时优先使用，方便修改规则。"""
+    custom = DATA_DIR / "config.json"
+    return custom if custom.exists() else BASE_DIR / "config.json"
+
+
 def load_config(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
 def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")],
-    )
+    handlers = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
+    # 打包成窗口程序后没有控制台
+    if sys.stderr:
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", handlers=handlers)
 
 
-def open_context(playwright, config, headless=False, restore_auth=True, device_scale_factor=None):
+def open_context(playwright, config, headless=False, restore_auth=True, device_scale_factor=None, hidden_window=False):
     extra = {"device_scale_factor": device_scale_factor} if device_scale_factor else {}
-    context = playwright.chromium.launch_persistent_context(
-        str(PROFILE_DIR),
-        channel=config.get("browser_channel", "chrome"),
-        headless=headless,
-        viewport={"width": 1280, "height": 900},
-        **extra,
-    )
-    # QQ 登录 Cookie 是会话级的，浏览器关闭后不会留在资料目录里，需要单独恢复
-    if restore_auth and AUTH_FILE.exists():
-        context.add_cookies(json.loads(AUTH_FILE.read_text(encoding="utf-8")))
+    if hidden_window:
+        extra["args"] = HIDDEN_WINDOW_ARGS
+    preferred = config.get("browser_channel", "chrome")
+    channels = [preferred] + [c for c in BROWSER_CHANNELS if c != preferred]
+    context = None
+    for channel in channels:
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                str(PROFILE_DIR),
+                channel=channel,
+                headless=headless,
+                viewport={"width": 1280, "height": 900},
+                **extra,
+            )
+            break
+        except PlaywrightError as e:
+            # 只有“没装这个浏览器”才换下一个，其他错误（如资料被占用）照常抛出
+            if "is not found" not in str(e):
+                raise
+    if context is None:
+        raise BrowserNotFound("没有找到 Chrome 或 Edge，请先安装其中一个")
+    if restore_auth:
+        # 登录状态只以保存的文件为准。资料目录里残留的 Cookie 可能是别的账号，退出登录后也不能再生效
+        context.clear_cookies()
+        if AUTH_FILE.exists():
+            context.add_cookies(json.loads(AUTH_FILE.read_text(encoding="utf-8")))
     return context
 
 
 def has_login_cookie(cookies):
-    names = {c["name"] for c in cookies if c["domain"].endswith("qq.com") and c["value"]}
+    # graph.qq.com 和 ptlogin 上的 Cookie 只说明扫码确认了，授权跳转还没走完，活动页不认
+    names = {
+        c["name"]
+        for c in cookies
+        if c["domain"].endswith("qq.com") and not c["domain"].endswith(UNFINISHED_LOGIN_DOMAINS) and c["value"]
+    }
     qq_login = bool(names & {"uin", "p_uin"}) and bool(names & {"skey", "p_skey"})
     # 新版活动页走开放平台登录，Cookie 里是 openid 和 access_token
     connect_login = {"openid", "access_token"} <= names
@@ -206,6 +281,21 @@ def save_login_when_settled(context, page, should_stop=None, wait_seconds=LOGIN_
         if {"openid", "access_token"} <= names or time.time() > deadline or (should_stop and should_stop()):
             return
         page.wait_for_timeout(1000)
+
+
+def login_account():
+    """当前账号的类型，用于在页面上显示。没有登录时返回 None。"""
+    if not login_saved():
+        return None
+    cookies = json.loads(AUTH_FILE.read_text(encoding="utf-8"))
+    kinds = {c["value"] for c in cookies if c["name"] == "acctype"}
+    if "wx" in kinds:
+        return "微信"
+    return "QQ"
+
+
+def logout():
+    AUTH_FILE.unlink(missing_ok=True)
 
 
 def stop_words(config):
@@ -301,7 +391,20 @@ def discover_activities(page, config, url=LOGIN_URL):
             found[key] = {"name": link["text"], "url": clean}
     for item in found.values():
         item["name"] = item["name"] or urlsplit(item["url"]).path
-    return list(found.values())
+    max_age = config.get("activity_max_age_days", DEFAULT_ACTIVITY_MAX_AGE_DAYS)
+    return [item for item in found.values() if is_recent_activity(item["url"], max_age)]
+
+
+def is_recent_activity(url, max_age_days, today=None):
+    """活动网址里带有上线日期，太旧的基本已结束。没有日期的保留。"""
+    match = ACTIVITY_DATE_RE.search(url)
+    if not match:
+        return True
+    try:
+        started = date(*map(int, match.groups()))
+    except ValueError:
+        return True
+    return ((today or date.today()) - started).days <= max_age_days
 
 
 def merge_activities(configured, discovered):
@@ -341,6 +444,13 @@ def wait_for_captcha(page, config, headless):
 def needs_login(page, config):
     if not has_login_cookie(page.context.cookies()):
         return True
+    # 活动规则里也可能写着“请先登录”，所以页面显示已登录时以它为准
+    for frame in safe_frames(page):
+        try:
+            if frame.evaluate(HAS_TEXT_JS, config.get("logged_in_markers", [])):
+                return False
+        except PlaywrightError:
+            continue
     if any(m in f.url for f in safe_frames(page) for m in LOGIN_URL_MARKERS):
         return True
     for frame in safe_frames(page):
@@ -475,7 +585,7 @@ def process_activity(page, activity, config, dry_run, headless, stats=None, clai
     page.wait_for_timeout(config.get("page_settle_ms", 3000))
 
     if needs_login(page, config):
-        log.error("  未登录或登录已失效，请先运行: python cf_claim.py login")
+        log.error("  未登录或登录已失效，请重新登录")
         emit("notice", level="error", text="未登录或登录已失效，请重新登录")
         return "need_login"
     if not wait_for_captcha(page, config, headless):
@@ -606,6 +716,8 @@ def cmd_login(config, emit=no_emit, auto_close=False, should_stop=None, timeout_
     deadline = time.time() + timeout_seconds if timeout_seconds else None
     with sync_playwright() as p:
         context = open_context(p, config, restore_auth=False)
+        # 资料里可能留着上次的登录，不清掉会被当成这次已经登录成功，也就没法切换账号
+        context.clear_cookies()
         page = context.pages[0] if context.pages else context.new_page()
         for attempt in range(3):
             try:
@@ -620,11 +732,20 @@ def cmd_login(config, emit=no_emit, auto_close=False, should_stop=None, timeout_
         else:
             say("请在打开的浏览器中登录 QQ，看到“已检测到登录”后关闭浏览器窗口。")
         saved = False
+        confirmed = False
         names = set()
         try:
             while context.pages:
-                context.pages[0].wait_for_timeout(1000)
+                try:
+                    context.pages[-1].wait_for_timeout(1000)
+                except PlaywrightError:
+                    # 授权过程中弹出的页面会自己关闭，只要还有窗口就继续等
+                    if not context.pages:
+                        break
                 cookies = context.cookies()
+                if not confirmed and any(c["name"] == "p_skey" and c["value"] for c in cookies):
+                    confirmed = True
+                    say("QQ 已确认，正在完成授权。如果窗口或手机上出现授权页面，请点确认。")
                 names = {c["name"] for c in cookies if c["domain"].endswith("qq.com") and c["value"]}
                 if has_login_cookie(cookies):
                     AUTH_FILE.write_text(json.dumps(cookies, ensure_ascii=False), encoding="utf-8")
@@ -644,41 +765,49 @@ def cmd_login(config, emit=no_emit, auto_close=False, should_stop=None, timeout_
             pass
     if not saved:
         say("没有检测到登录，请重新登录。")
-        # 只输出名称不输出值，用来排查登录方式
-        print("已有的 Cookie 名称:", ", ".join(sorted(names)) or "无")
+        # 只记录名称不记录值，用来排查登录方式
+        log.info("登录未完成，已有的 Cookie 名称: %s", ", ".join(sorted(names)) or "无")
         return 1
     say("登录状态已保存。")
     return 0
 
 
-def open_qr_page(page):
+def open_qr_page(page, method):
     page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(1000)
     page.locator("#dologin").click(timeout=15000)
-
-
-def find_qr_frame(page):
-    for frame in safe_frames(page):
+    tab = LOGIN_METHODS[method]["tab"]
+    if tab:
         try:
-            if frame.locator("#qrlogin_img").is_visible():
-                return frame
+            page.locator(tab).first.click(timeout=10000)
         except PlaywrightError:
-            continue
-    return None
+            pass  # 没有切换入口时，后面找不到二维码会走重试
 
 
 def is_visible(frame, selector):
     try:
-        return frame.locator(selector).is_visible()
+        return frame.locator(selector).first.is_visible()
     except PlaywrightError:
         return False
 
 
-def run_qr_login(page, emit, on_qr, should_stop=None, deadline=None, poll_ms=1000, missing_retry=QR_MISSING_RETRY_SECONDS):
+def is_visible_anywhere(page, selector):
+    return any(is_visible(frame, selector) for frame in safe_frames(page))
+
+
+def find_qr_frame(page, method):
+    for frame in safe_frames(page):
+        if is_visible(frame, LOGIN_METHODS[method]["qr"]):
+            return frame
+    return None
+
+
+def run_qr_login(page, emit, on_qr, should_stop=None, deadline=None, poll_ms=1000, missing_retry=QR_MISSING_RETRY_SECONDS, method="qq"):
     """在后台打开官方登录页，把二维码交给 on_qr，等手机扫码确认。返回是否登录成功。"""
+    selectors = LOGIN_METHODS[method]
     context = page.context
     context.clear_cookies()
-    open_qr_page(page)
+    open_qr_page(page, method)
     last_png = None
     version = 0
     scanned = False
@@ -688,46 +817,55 @@ def run_qr_login(page, emit, on_qr, should_stop=None, deadline=None, poll_ms=100
         if has_login_cookie(context.cookies()):
             save_login_when_settled(context, page, should_stop)
             return True
-        frame = find_qr_frame(page)
+        frame = find_qr_frame(page, method)
         if frame:
             missing_since = time.time()
-            if is_visible(frame, "#qrlogin_step2") and not scanned:
+            if is_visible(frame, selectors["expired"]):
+                emit("notice", level="info", text="二维码已失效，正在刷新")
+                open_qr_page(page, method)
+                last_png = None
+                scanned = False
+                continue
+            if is_visible(frame, selectors["scanned"]) and not scanned:
                 scanned = True
                 emit("login_scanned")
-            if is_visible(frame, "#qr_invalid") and not scanned:
-                emit("notice", level="info", text="二维码已过期，正在刷新")
-                open_qr_page(page)
-                last_png = None
-                continue
             try:
-                png = frame.locator("#qrlogin_img").screenshot(timeout=3000)
+                png = frame.locator(selectors["qr"]).first.screenshot(timeout=3000)
             except PlaywrightError:
                 png = None
             if png and png != last_png:
                 last_png = png
                 version += 1
                 on_qr(png)
-                emit("login_qr", version=version)
+                emit("login_qr", version=version, method=method)
+        elif scanned and is_visible_anywhere(page, selectors["expired"]):
+            emit("notice", level="info", text="这次登录已取消，正在刷新二维码")
+            open_qr_page(page, method)
+            last_png = None
+            scanned = False
         elif not scanned and time.time() - missing_since > missing_retry:
             retries += 1
             if retries > 2:
                 emit("notice", level="error", text="取不到登录二维码，可以改用电脑上的登录窗口")
                 return False
-            open_qr_page(page)
+            open_qr_page(page, method)
             missing_since = time.time()
         page.wait_for_timeout(poll_ms)
     return False
 
 
-def cmd_qr_login(config, emit=no_emit, on_qr=None, should_stop=None, timeout_seconds=None):
+def cmd_qr_login(config, emit=no_emit, on_qr=None, should_stop=None, timeout_seconds=None, method="qq"):
     """页面内扫码登录。人不在电脑旁时用这个。登录成功前不会覆盖已保存的登录信息。"""
     deadline = time.time() + timeout_seconds if timeout_seconds else None
     with sync_playwright() as p:
         # 放大截图，二维码在手机上才足够清晰
-        context = open_context(p, config, headless=True, restore_auth=False, device_scale_factor=4)
+        hidden_window = LOGIN_METHODS[method].get("hidden_window", False)
+        context = open_context(
+            p, config, headless=not hidden_window, restore_auth=False, device_scale_factor=4, hidden_window=hidden_window
+        )
         page = context.pages[0] if context.pages else context.new_page()
         try:
-            saved = run_qr_login(page, emit, on_qr or (lambda png: None), should_stop, deadline)
+            saved = run_qr_login(page, emit, on_qr or (lambda png: None), should_stop, deadline, method=method)
         finally:
             context.close()
     if saved:
@@ -794,6 +932,14 @@ def cmd_run(config, dry_run, headless, discover=False, only=None, activities=Non
                 stopped = True
                 break
             name = activity.get("name", activity["url"])
+            if page.is_closed():
+                try:
+                    page = context.new_page()
+                except PlaywrightError:
+                    log.error("浏览器已关闭，停止领取")
+                    emit("notice", level="error", text="浏览器被关闭了，已停止领取，请重试")
+                    failed += 1
+                    break
             emit("activity_start", activity=name, index=index, total=len(activities))
             try:
                 result = process_activity(page, activity, config, dry_run, headless, stats, claimed, emit, should_stop)
@@ -812,8 +958,14 @@ def cmd_run(config, dry_run, headless, discover=False, only=None, activities=Non
             # 点击可能打开新标签页，处理完一个活动就关掉
             for extra in context.pages:
                 if extra is not page:
-                    extra.close()
-        context.close()
+                    try:
+                        extra.close()
+                    except PlaywrightError:
+                        pass
+        try:
+            context.close()
+        except PlaywrightError:
+            pass
     if code is None:
         log.info("全部结束: 共 %d 个活动，未完成 %d 个，统计 %s", len(activities), failed, dict(stats))
         code = 1 if failed else 0
@@ -824,7 +976,7 @@ def cmd_run(config, dry_run, headless, discover=False, only=None, activities=Non
 
 def main():
     parser = argparse.ArgumentParser(description="穿越火线活动自动领取")
-    parser.add_argument("--config", default=str(BASE_DIR / "config.json"))
+    parser.add_argument("--config", default=str(config_path()))
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("login", help="手动登录并保存状态")
     sub.add_parser("discover", help="列出官网上的活动页")

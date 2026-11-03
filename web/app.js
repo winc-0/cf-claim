@@ -1,7 +1,8 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const SELECTION_KEY = "cf-selected-activities";
+const UNCHECKED_KEY = "cf-unchecked-activities";
+const CONSENT_KEY = "cf-consent-v1";
 const LABEL_CLASS = {
   "成功": "ok",
   "已领过": "done",
@@ -10,6 +11,7 @@ const LABEL_CLASS = {
 };
 const LABEL_TEXT = { "未开放或不满足条件": "未开放" };
 
+const LOGIN_APP = { qq: "手机 QQ", wechat: "手机微信" };
 const view = { busy: null, login: false, loaded: false, qrLogin: false };
 let run = freshRun();
 
@@ -24,20 +26,28 @@ function el(tag, className, text) {
   return node;
 }
 
-function readSelection() {
+function readStored(key, fallback) {
   try {
-    return JSON.parse(localStorage.getItem(SELECTION_KEY)) || [];
+    return JSON.parse(localStorage.getItem(key)) ?? fallback;
   } catch {
-    return [];
+    return fallback;
   }
 }
 
-function saveSelection() {
+function writeStored(key, value) {
   try {
-    localStorage.setItem(SELECTION_KEY, JSON.stringify(selectedUrls()));
+    localStorage.setItem(key, JSON.stringify(value));
   } catch {
-    // 无痕模式下可能不能保存，下次重新勾选即可
+    // 保存不了只是下次要重新选择，不影响使用
   }
+}
+
+function uncheckedUrls() {
+  return [...document.querySelectorAll("#activities input:not(:checked)")].map((box) => box.value);
+}
+
+function saveSelection() {
+  writeStored(UNCHECKED_KEY, uncheckedUrls());
 }
 
 function selectedUrls() {
@@ -81,43 +91,34 @@ function renderStatus() {
 function renderControls() {
   const busy = Boolean(view.busy);
   const none = selectedUrls().length === 0;
-  $("btn-run").disabled = busy || none;
-  $("btn-preview").disabled = busy || none;
+  $("btn-run").disabled = busy || none || !view.login;
+  $("btn-preview").disabled = busy || none || !view.login;
+  let hint = "";
+  if (!view.login) hint = "请先登录 QQ 或微信。";
+  else if (none) hint = "请至少勾选一个活动。";
+  $("run-hint").textContent = hint;
+  $("run-hint").hidden = !hint || busy;
   $("btn-login").disabled = busy;
+  $("btn-login-wx").disabled = busy;
   $("btn-refresh").disabled = busy;
   $("btn-login-window").disabled = busy;
   $("btn-stop").hidden = !(view.busy === "run" || view.busy === "login");
   $("btn-stop").textContent = view.busy === "login" ? "取消登录" : "停止";
   $("login-panel").hidden = view.busy !== "login" || !view.qrLogin;
+  $("login-window-hint").hidden = view.busy !== "login" || view.qrLogin;
   if (view.busy !== "login") {
     view.qrLogin = false;
     $("login-qr").hidden = true;
     $("login-qr").removeAttribute("src");
     $("login-status").textContent = "正在获取二维码…";
-    clearLoginLinks();
   }
   const login = $("login-state");
-  login.textContent = view.login ? "已保存登录" : "未登录";
+  login.textContent = view.login ? `已登录：${view.account}` : "未登录";
+  $("btn-logout").hidden = !view.login;
+  $("btn-logout").disabled = busy;
+  $("btn-login").textContent = view.login && view.account === "QQ" ? "换 QQ 号" : "QQ 登录";
+  $("btn-login-wx").textContent = view.login && view.account === "微信" ? "换微信号" : "微信登录";
   login.className = `pill ${view.login ? "ok" : "bad"}`;
-}
-
-function clearLoginLinks() {
-  $("login-links").hidden = true;
-  $("link-qq").removeAttribute("href");
-  $("link-direct").removeAttribute("href");
-}
-
-async function loadLoginLinks() {
-  try {
-    const { qq, direct } = await api("/api/login/link");
-    // 请求期间登录可能已经结束，这时不能再把链接放回页面
-    if (view.busy !== "login") return;
-    $("link-qq").href = qq;
-    $("link-direct").href = direct;
-    $("login-links").hidden = false;
-  } catch {
-    clearLoginLinks();
-  }
 }
 
 function resetRun(total, dryRun) {
@@ -149,8 +150,14 @@ function handleEvent(event) {
     case "state":
       view.busy = event.busy;
       view.login = event.login;
+      view.account = event.account;
       renderStatus();
       if (!event.busy && $("history-box").open) loadHistory();
+      // 列表过期就自动刷新，朋友第一次打开不用自己找活动
+      if (!event.busy && view.stale) {
+        view.stale = false;
+        post("/api/refresh");
+      }
       break;
     case "run_start":
       resetRun(event.total, event.dry_run);
@@ -206,7 +213,7 @@ function handleEvent(event) {
         $("login-qr").src = `/api/login/qr.png?v=${event.seq}`;
         $("login-qr").hidden = false;
         $("login-status").textContent = "等待扫码";
-        loadLoginLinks();
+        $("login-app").textContent = LOGIN_APP[event.method] || LOGIN_APP.qq;
       }
       break;
     case "login_scanned":
@@ -266,8 +273,10 @@ async function post(path, body) {
 }
 
 async function loadActivities() {
-  const { activities } = await api("/api/activities");
-  const selected = new Set(view.loaded ? selectedUrls() : readSelection());
+  const { activities, stale } = await api("/api/activities");
+  // 记录取消勾选的活动，这样新发现的活动默认会被领取
+  const unchecked = new Set(view.loaded ? uncheckedUrls() : readStored(UNCHECKED_KEY, []));
+  if (!view.loaded) view.stale = stale;
   view.loaded = true;
   const list = $("activities");
   list.replaceChildren();
@@ -275,7 +284,7 @@ async function loadActivities() {
     const box = el("input");
     box.type = "checkbox";
     box.value = activity.url;
-    box.checked = selected.has(activity.url);
+    box.checked = !unchecked.has(activity.url);
     box.addEventListener("change", () => {
       saveSelection();
       renderControls();
@@ -304,6 +313,7 @@ async function loadHistory() {
 
 async function loadAccess() {
   const { urls } = await api("/api/access");
+  $("phone-box").hidden = urls.length === 0;
   const list = $("phone-list");
   list.replaceChildren();
   urls.forEach((entry, index) => {
@@ -330,14 +340,33 @@ async function startRun(dryRun) {
   if (started) window.scrollTo({ top: 0 });
 }
 
-$("btn-run").addEventListener("click", () => startRun(false));
+$("btn-run").addEventListener("click", () => {
+  if (readStored(CONSENT_KEY, false)) startRun(false);
+  else {
+    $("consent").hidden = false;
+    $("btn-consent").focus();
+  }
+});
+$("btn-consent").addEventListener("click", () => {
+  writeStored(CONSENT_KEY, true);
+  $("consent").hidden = true;
+  startRun(false);
+});
+$("btn-consent-cancel").addEventListener("click", () => {
+  $("consent").hidden = true;
+});
 $("btn-preview").addEventListener("click", () => startRun(true));
 $("btn-stop").addEventListener("click", () => post("/api/stop"));
-$("btn-login").addEventListener("click", async () => {
+async function startQrLogin(method) {
   view.qrLogin = true;
-  if (!(await post("/api/login"))) view.qrLogin = false;
+  $("login-app").textContent = LOGIN_APP[method];
+  if (!(await post("/api/login", { method }))) view.qrLogin = false;
   renderControls();
-});
+}
+
+$("btn-login").addEventListener("click", () => startQrLogin("qq"));
+$("btn-login-wx").addEventListener("click", () => startQrLogin("wechat"));
+$("btn-logout").addEventListener("click", () => post("/api/logout"));
 $("btn-login-window").addEventListener("click", () => post("/api/login", { window: true }));
 $("btn-refresh").addEventListener("click", () => post("/api/refresh"));
 $("btn-all").addEventListener("click", () => setAll(true));
@@ -345,10 +374,7 @@ $("btn-none").addEventListener("click", () => setAll(false));
 $("history-box").addEventListener("toggle", () => {
   if ($("history-box").open) loadHistory();
 });
-$("phone-box").addEventListener("toggle", () => {
-  if ($("phone-box").open) loadAccess();
-});
-
 renderCounts();
 renderStatus();
+loadAccess();
 loadActivities().finally(connect);

@@ -38,20 +38,22 @@
 
   <section class="panel controls">
     <div class="login-row">
-      <span id="login-state" class="pill">检查中</span>
-      <button id="btn-login" type="button" class="ghost">登录 QQ</button>
-    </div>
-    <div id="login-panel" class="login-panel" hidden>
-      <img id="login-qr" class="qr" alt="QQ 登录二维码" width="240" height="240" hidden>
-      <p id="login-status" class="small">正在获取二维码…</p>
-      <p class="muted small">用手机 QQ 扫一扫。只有这一部手机时，可以截图后在扫一扫里从相册选择。这个二维码能登录你的账号，不要发给别人。</p>
-      <div id="login-links" class="login-links" hidden>
-        <a id="link-qq" class="button primary" rel="noreferrer">在 QQ 中确认（试验）</a>
-        <a id="link-direct" class="button ghost" rel="noreferrer" target="_blank">用方式二打开（试验）</a>
-        <p class="muted small">手机上使用。依赖 QQ 的非公开跳转，可能打不开或只提示去扫码。打不开时继续用扫码。</p>
+      <div class="login-state">
+        <span id="login-state" class="pill">检查中</span>
+        <button id="btn-logout" type="button" class="link" hidden>退出登录</button>
+      </div>
+      <div class="login-buttons">
+        <button id="btn-login" type="button" class="ghost">QQ 登录</button>
+        <button id="btn-login-wx" type="button" class="ghost">微信登录</button>
       </div>
     </div>
-    <button id="btn-login-window" type="button" class="link">改用电脑上的登录窗口</button>
+    <div id="login-panel" class="login-panel" hidden>
+      <img id="login-qr" class="qr" alt="登录二维码" width="240" height="240" hidden>
+      <p id="login-status" class="small">正在获取二维码…</p>
+      <p class="muted small">打开<span id="login-app">手机 QQ</span>，用里面的扫一扫，不要用相机或其他应用。手机上出现授权页面时也要点确认。这个二维码能登录你的账号，不要发给别人。</p>
+    </div>
+    <p id="login-window-hint" class="muted small" hidden>登录窗口已打开。用手机 QQ 或微信里的扫一扫扫码并确认。如果窗口或手机上出现授权页面，也要点确认，完成后窗口会自动关闭。</p>
+    <button id="btn-login-window" type="button" class="link">扫码登录不上？改用登录窗口</button>
 
     <div class="section-head">
       <h2>选择活动</h2>
@@ -63,16 +65,30 @@
     </div>
     <ul id="activities" class="activities"></ul>
     <p id="activities-empty" class="empty" hidden>目前只有固定活动，点“刷新列表”从官网获取更多。</p>
-    <p class="muted small">脚本看不到活动规则，无法识别多选一和无提示的扣积分。按钮多的活动请先看规则，或先预览。</p>
+    <p class="muted small">会自动跳过兑换、抽奖、付费和自选类按钮，遇到需要决定的弹窗会停下。不想领的活动可以取消勾选。</p>
 
     <label class="check"><input id="opt-show" type="checkbox"> 在电脑上显示浏览器窗口（遇到验证码时使用）</label>
 
     <div class="actions">
-      <button id="btn-run" type="button" class="primary">开始领取</button>
+      <button id="btn-run" type="button" class="primary">一键领取</button>
       <button id="btn-preview" type="button" class="ghost">只预览</button>
       <button id="btn-stop" type="button" class="danger" hidden>停止</button>
     </div>
+    <p id="run-hint" class="muted small" hidden></p>
     <p id="action-error" class="error small" role="alert" hidden></p>
+    <div id="consent" class="consent" role="alertdialog" aria-labelledby="consent-title" hidden>
+      <h3 id="consent-title">开始前请了解</h3>
+      <ul>
+        <li>这是第三方工具，不是腾讯官方产品。自动操作可能违反腾讯的用户协议，有被风控的风险，后果由你自己承担。</li>
+        <li>它看不到活动规则。多选一或没有提示的扣积分可能拦不住，贵重账号请先看活动规则，或点“只预览”。</li>
+        <li>道具发到当前绑定的大区，页面提示领到不代表已到账，以游戏内为准。</li>
+        <li>登录信息只保存在这台电脑上，程序不会把它发给第三方。</li>
+      </ul>
+      <div class="actions">
+        <button id="btn-consent" type="button" class="primary">我已了解，开始领取</button>
+        <button id="btn-consent-cancel" type="button" class="ghost">取消</button>
+      </div>
+    </div>
   </section>
 
   <section class="panel">
@@ -87,7 +103,7 @@
     <p id="history-empty" class="empty" hidden>还没有记录。</p>
   </details>
 
-  <details class="panel" id="phone-box">
+  <details class="panel" id="phone-box" hidden>
     <summary>在手机上打开</summary>
     <p class="muted small">用手机扫码打开。二维码和链接都含访问口令，不要发给别人。</p>
     <div id="phone-list"></div>

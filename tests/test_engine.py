@@ -6,12 +6,14 @@ import tempfile
 import time
 import unittest
 from collections import Counter
+from datetime import date
 from pathlib import Path
 from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from playwright.sync_api import Error as PlaywrightError  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
 import cf_claim  # noqa: E402
@@ -39,6 +41,29 @@ class ParsingTest(unittest.TestCase):
         self.assertFalse(cf_claim.has_login_cookie(cookies("uin", "skey", value="")))
         self.assertFalse(cf_claim.has_login_cookie(cookies("uin", "skey", domain=".evil.com")))
 
+    def test_half_finished_qq_login_is_not_logged_in(self):
+        # 真实情况：QQ 确认后只有 graph.qq.com 上的 Cookie，授权跳转还没走完
+        self.assertFalse(cf_claim.has_login_cookie(cookies("p_uin", "p_skey", domain=".graph.qq.com")))
+        self.assertFalse(cf_claim.has_login_cookie(cookies("p_uin", "p_skey", domain=".ptlogin2.qq.com")))
+        self.assertTrue(cf_claim.has_login_cookie(cookies("openid", "access_token", domain=".cf.qq.com")))
+
+    def test_login_account_and_logout(self):
+        original = cf_claim.AUTH_FILE
+        with tempfile.TemporaryDirectory() as tmp:
+            cf_claim.AUTH_FILE = Path(tmp) / "auth.json"
+            try:
+                self.assertIsNone(cf_claim.login_account())
+                base = cookies("openid", "access_token", domain=".cf.qq.com")
+                cf_claim.AUTH_FILE.write_text(json.dumps(base + [{"name": "acctype", "value": "wx", "domain": ".cf.qq.com"}]), encoding="utf-8")
+                self.assertEqual(cf_claim.login_account(), "微信")
+                cf_claim.AUTH_FILE.write_text(json.dumps(base + [{"name": "acctype", "value": "qc", "domain": ".cf.qq.com"}]), encoding="utf-8")
+                self.assertEqual(cf_claim.login_account(), "QQ")
+                cf_claim.logout()
+                self.assertFalse(cf_claim.login_saved())
+                cf_claim.logout()  # 重复退出不报错
+            finally:
+                cf_claim.AUTH_FILE = original
+
     def test_item_from_real_messages(self):
         name = lambda m: cf_claim.item_from_message(m, self.config)  # noqa: E731
         self.assertEqual(name("恭喜您获得了礼包： 许愿币 确定 ×"), "许愿币")
@@ -50,7 +75,7 @@ class ParsingTest(unittest.TestCase):
         self.assertEqual(cf_claim.classify("抱歉，您已在本大区领取过了~"), "已领过")
         self.assertEqual(cf_claim.classify("非常抱歉，此时不在该活动开放时间段！"), "未开放或不满足条件")
         self.assertEqual(cf_claim.classify("活动将于11月5日0点开启，敬请期待！"), "未开放或不满足条件")
-        self.assertEqual(cf_claim.classify("您当前活动绑定的大区为： 河北一区"), "其他")
+        self.assertEqual(cf_claim.classify("您当前活动绑定的大区为： 示例大区"), "其他")
         self.assertEqual(cf_claim.classify("需要手动处理：扣除点券"), "需手动处理")
 
     def test_response_parsing(self):
@@ -58,6 +83,77 @@ class ParsingTest(unittest.TestCase):
         self.assertEqual(parse('{"ret":"0","sPackageName":"\\u96f7\\u795e"}'), ["雷神"])
         self.assertEqual(parse('jsonp({"ret":"101","sPackageName":"不算"})'), [])
         self.assertEqual(parse('{"ret":"0","sPackageName":"不算"}', "iPageSize=30"), [])
+
+    def test_recent_activity_filter(self):
+        today = date(2026, 11, 2)
+        recent = cf_claim.is_recent_activity
+        self.assertTrue(recent("https://cf.qq.com/cp/a20261022nov/pc/index.shtml", 120, today))
+        self.assertTrue(recent("https://cf.qq.com/cp/a20260920septfirst/", 120, today))
+        self.assertFalse(recent("https://cf.qq.com/cp/a20250702cfhero/index.html", 120, today))
+        self.assertFalse(recent("https://cf.qq.com/cp/a20220314free/index.html", 120, today))
+        self.assertTrue(recent("https://cf.qq.com/act/special/", 120, today))  # 没有日期的保留
+        self.assertTrue(recent("https://cf.qq.com/cp/a20269999x/", 120, today))  # 日期不合法的保留
+
+    def test_browser_falls_back_to_edge(self):
+        class Chromium:
+            def __init__(self, missing):
+                self.missing, self.tried = missing, []
+
+            def launch_persistent_context(self, path, channel, **kwargs):
+                self.tried.append(channel)
+                if channel in self.missing:
+                    raise PlaywrightError(f'Chromium distribution "{channel}" is not found at x')
+                return Context()
+
+        class Context:
+            def add_cookies(self, cookies):
+                pass
+
+        class Playwright:
+            def __init__(self, missing):
+                self.chromium = Chromium(missing)
+
+        config = {"browser_channel": "chrome"}
+        auto = Playwright({"chrome"})
+        self.assertIsInstance(cf_claim.open_context(auto, config, restore_auth=False), Context)
+        self.assertEqual(auto.chromium.tried, ["chrome", "msedge"])
+        with self.assertRaises(cf_claim.BrowserNotFound):
+            cf_claim.open_context(Playwright({"chrome", "msedge"}), config, restore_auth=False)
+
+        class Locked(Chromium):
+            def launch_persistent_context(self, path, channel, **kwargs):
+                self.tried.append(channel)
+                raise PlaywrightError("Target page, context or browser has been closed")
+
+        locked = Playwright(set())
+        locked.chromium = Locked(set())
+        with self.assertRaises(PlaywrightError):  # 资料被占用不能当成没装浏览器
+            cf_claim.open_context(locked, config, restore_auth=False)
+        self.assertEqual(locked.chromium.tried, ["chrome"])
+
+    def test_hidden_window_only_adds_offscreen_args(self):
+        seen = {}
+
+        class Context:
+            def add_cookies(self, cookies):
+                pass
+
+        class Chromium:
+            def launch_persistent_context(self, path, **kwargs):
+                seen.update(kwargs)
+                return Context()
+
+        class Playwright:
+            chromium = Chromium()
+
+        cf_claim.open_context(Playwright(), {}, headless=False, restore_auth=False, hidden_window=True)
+        self.assertFalse(seen["headless"])  # QQ 要用真实窗口
+        self.assertIn("--window-position=-32000,-32000", seen["args"])
+        seen.clear()
+        cf_claim.open_context(Playwright(), {}, restore_auth=False)
+        self.assertNotIn("args", seen)
+        self.assertTrue(cf_claim.LOGIN_METHODS["qq"]["hidden_window"])
+        self.assertFalse(cf_claim.LOGIN_METHODS["wechat"].get("hidden_window", False))
 
     def test_merge_keeps_disabled_off(self):
         merged = cf_claim.merge_activities(
@@ -188,6 +284,14 @@ class BrowserTest(unittest.TestCase):
         found = cf_claim.find_buttons(self.page.main_frame, ["领取"], [], False, self.config)
         self.assertEqual(found, ["领取"])  # 只有 display 那个不是兑换或付费
 
+    def test_logged_in_page_mentioning_login_is_not_logged_out(self):
+        self.page.set_content("<p>欢迎您，玩家</p><p>规则：领取前请先登录游戏</p>")
+        self.assertFalse(cf_claim.needs_login(self.page, self.config))
+
+    def test_expired_login_is_detected_from_page(self):
+        self.page.set_content("<p>规则</p><p>请先登录</p>")
+        self.assertTrue(cf_claim.needs_login(self.page, self.config))
+
     def test_stop_request_ends_activity(self):
         seen = {"n": 0}
 
@@ -198,6 +302,52 @@ class BrowserTest(unittest.TestCase):
         status, _, clicks = self.run_page("activity.html", should_stop=stop)
         self.assertEqual(status, "stopped")
         self.assertEqual(len(clicks), 2)
+
+
+class RunRecoveryTest(unittest.TestCase):
+    """页面或浏览器中途消失时，领取要能继续或干净地结束。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.saved = (cf_claim.PROFILE_DIR, cf_claim.AUTH_FILE, cf_claim.process_activity)
+        cf_claim.PROFILE_DIR = Path(self.tmp.name) / "profile"
+        cf_claim.AUTH_FILE = Path(self.tmp.name) / "auth.json"
+        self.events = []
+        self.seen = []
+
+    def tearDown(self):
+        cf_claim.PROFILE_DIR, cf_claim.AUTH_FILE, cf_claim.process_activity = self.saved
+        self.tmp.cleanup()
+
+    def run_all(self, fake):
+        cf_claim.process_activity = fake
+        config = {"browser_channel": "chrome"}
+        activities = [{"name": n, "url": "about:blank"} for n in ("甲", "乙", "丙")]
+        emit = lambda kind, **fields: self.events.append((kind, fields))  # noqa: E731
+        return cf_claim.cmd_run(config, True, True, activities=activities, emit=emit)
+
+    def test_closed_page_is_replaced(self):
+        def fake(page, activity, *args):
+            self.seen.append((activity["name"], page.is_closed()))
+            if activity["name"] == "甲":
+                page.close()
+                raise PlaywrightError("Target page, context or browser has been closed")
+            return "ok"
+
+        self.assertEqual(self.run_all(fake), 1)  # 甲失败，整体算未全部完成
+        self.assertEqual(self.seen, [("甲", False), ("乙", False), ("丙", False)])
+
+    def test_closed_browser_reports_once(self):
+        def fake(page, activity, *args):
+            self.seen.append(activity["name"])
+            page.context.close()
+            raise PlaywrightError("Target page, context or browser has been closed")
+
+        self.assertEqual(self.run_all(fake), 1)
+        self.assertEqual(self.seen, ["甲"])  # 浏览器没了就不再逐个报失败
+        notices = [f["text"] for k, f in self.events if k == "notice" and "浏览器被关闭" in f["text"]]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual([k for k, _ in self.events].count("run_done"), 1)
 
 
 class QrLoginTest(unittest.TestCase):
@@ -252,7 +402,24 @@ class QrLoginTest(unittest.TestCase):
         self.serve("expire")
         self.assertTrue(self.login(deadline=time.time() + 20))
         texts = [f.get("text") for k, f in self.events if k == "notice"]
-        self.assertIn("二维码已过期，正在刷新", texts)
+        self.assertIn("二维码已失效，正在刷新", texts)
+
+    def test_wechat_login(self):
+        self.serve("wx")
+        self.assertTrue(self.login(deadline=time.time() + 20, method="wechat"))
+        names = {c["name"] for c in json.loads(cf_claim.AUTH_FILE.read_text(encoding="utf-8"))}
+        self.assertTrue({"openid", "access_token"} <= names, names)
+        self.assertNotIn("p_skey", names)
+        self.assertTrue(cf_claim.login_saved())
+        kinds = dict(self.events)
+        self.assertEqual(kinds["login_qr"]["method"], "wechat")
+        self.assertIn("login_scanned", kinds)
+
+    def test_cancelled_wechat_qr_is_refreshed(self):
+        self.serve("wx-cancel")
+        self.assertTrue(self.login(deadline=time.time() + 20, method="wechat"))
+        texts = [f.get("text") for k, f in self.events if k == "notice"]
+        self.assertIn("二维码已失效，正在刷新", texts)
 
     def test_stop_keeps_existing_login(self):
         self.serve("never")

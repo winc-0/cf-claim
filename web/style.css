@@ -142,13 +142,12 @@ ul, ol { margin: 0; padding: 0; list-style: none; }
 .history li { border-left-color: var(--line); background: var(--neutral-bg); }
 .history { margin-top: 10px; }
 
-.login-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.login-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; }
+.login-buttons { display: flex; gap: 8px; }
+.login-state { display: flex; align-items: center; gap: 4px; }
 .login-panel { display: grid; gap: 8px; justify-items: center; margin-top: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; text-align: center; }
 .login-panel .qr { width: 240px; height: 240px; margin: 0; }
 #login-status { font-weight: 600; }
-.login-links { display: grid; gap: 8px; width: 100%; }
-a.button { display: flex; align-items: center; justify-content: center; min-height: 44px; padding: 0 16px; border: 1px solid transparent; border-radius: 8px; font-weight: 600; text-decoration: none; }
-a.button.ghost { border-color: var(--line); }
 .access { margin-top: 12px; }
 .access h3 { margin: 0; font-size: 14px; font-weight: 600; }
 
@@ -214,6 +213,11 @@ button:focus-visible, summary:focus-visible, input:focus-visible { outline: 2px 
 .tag.bad { background: var(--bad-bg); color: var(--bad); }
 
 summary { min-height: 28px; font-weight: 600; cursor: pointer; }
+
+#run-hint, #login-window-hint { margin-top: 8px; }
+.consent { margin-top: 12px; padding: 12px; border: 1px solid var(--warn); border-radius: 8px; background: var(--warn-bg); }
+.consent h3 { margin: 0 0 6px; font-size: 15px; }
+.consent ul { display: grid; gap: 6px; margin-bottom: 4px; padding-left: 18px; list-style: disc; font-size: 13px; }
 
 .qr { display: block; width: 200px; height: 200px; margin: 10px 0; padding: 6px; background: #fff; border-radius: 6px; }
 .url { overflow-wrap: anywhere; color: var(--muted); }

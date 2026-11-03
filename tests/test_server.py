@@ -1,8 +1,6 @@
 """网页服务测试。用假引擎代替真实领取，不打开浏览器。"""
 
-import base64
 import http.client
-import io
 import json
 import sys
 import tempfile
@@ -10,12 +8,10 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-
-import segno  # noqa: E402
 
 import cf_claim  # noqa: E402
 import cf_server  # noqa: E402
@@ -28,6 +24,7 @@ URL_B = "https://cf.qq.com/cp/b/"
 class FakeEngine:
     ITEMS_FILE = None
     merge_activities = staticmethod(cf_claim.merge_activities)
+    LOGIN_METHODS = cf_claim.LOGIN_METHODS
 
     def __init__(self):
         self.calls = []
@@ -35,9 +32,17 @@ class FakeEngine:
         self.release.set()
         self.code = 0
         self.qr_png = b"\x89PNG-fake"
+        self.logged_in = True
 
     def login_saved(self):
-        return True
+        return self.logged_in
+
+    def login_account(self):
+        return "微信"
+
+    def logout(self):
+        self.logged_in = False
+        self.calls.append({"logout": True})
 
     def cmd_run(self, config, dry_run, headless, activities=None, emit=None, should_stop=None):
         self.calls.append({"dry_run": dry_run, "headless": headless, "urls": [a["url"] for a in activities]})
@@ -51,8 +56,8 @@ class FakeEngine:
         self.calls.append({"login": auto_close})
         return 0
 
-    def cmd_qr_login(self, config, emit=None, on_qr=None, should_stop=None, timeout_seconds=None):
-        self.calls.append({"qr_login": True})
+    def cmd_qr_login(self, config, emit=None, on_qr=None, should_stop=None, timeout_seconds=None, method="qq"):
+        self.calls.append({"qr_login": method})
         on_qr(self.qr_png)
         emit("login_qr", version=1)
         self.release.wait(5)
@@ -231,46 +236,70 @@ class ServerTest(unittest.TestCase):
         self.engine.release.set()
         self.wait_idle()
         self.assertEqual(self.request("GET", "/api/login/qr.png")[0].status, 404)
-        self.assertEqual(self.engine.calls, [{"qr_login": True}])
+        self.assertEqual(self.engine.calls, [{"qr_login": "qq"}])
 
-    @staticmethod
-    def qr_png(text):
-        out = io.BytesIO()
-        segno.make(text, error="m").save(out, kind="png", scale=8, border=4)
-        return out.getvalue()
+    def test_wechat_method_reaches_engine(self):
+        self.assertEqual(self.request("POST", "/api/login", {"method": "wechat"})[0].status, 200)
+        self.wait_idle()
+        self.assertEqual(self.engine.calls, [{"qr_login": "wechat"}])
 
-    def test_decode_login_link_only_accepts_qq(self):
-        decode = cf_server.decode_login_link
-        good = "http://txz.qq.com/p?k=abc&f=716027609"
-        self.assertEqual(decode(self.qr_png(good)), good)
-        for bad in ("https://qq.com.evil.example/p", "https://evilqq.com/p", "mqqapi://x", "javascript:alert(1)"):
-            self.assertIsNone(decode(self.qr_png(bad)), bad)
-        self.assertIsNone(decode(b"not an image"))
+    def test_unknown_login_method_rejected(self):
+        for method in ("alipay", 1, None):
+            self.assertEqual(self.request("POST", "/api/login", {"method": method})[0].status, 400, method)
+        self.assertEqual(self.engine.calls, [])
 
-    def test_qq_open_url_encodes_link(self):
-        url = cf_server.qq_open_url("http://txz.qq.com/p?k=abc+/=&f=1")
-        self.assertTrue(url.startswith("mqqapi://forward/url?"))
-        value = parse_qs(urlsplit(url).query)["url_prefix"][0]
-        self.assertEqual(base64.b64decode(value).decode(), "http://txz.qq.com/p?k=abc+/=&f=1")
+    def test_activities_report_staleness(self):
+        data = json.loads(self.request("GET", "/api/activities")[1])
+        self.assertTrue(data["stale"])  # 没有缓存时要刷新
+        self.request("POST", "/api/refresh", {})
+        self.wait_idle()
+        self.assertFalse(json.loads(self.request("GET", "/api/activities")[1])["stale"])
 
-    def test_login_link_needs_token_and_is_cleared(self):
+    def test_missing_browser_message_reaches_page(self):
+        def fail(*args, **kwargs):
+            raise cf_claim.BrowserNotFound("没有找到 Chrome 或 Edge，请先安装其中一个")
+
+        self.engine.BrowserNotFound = cf_claim.BrowserNotFound
+        self.engine.fetch_activities = fail
+        self.request("POST", "/api/refresh", {})
+        self.wait_idle()
+        texts = [e.get("text") for e in self.app.events if e["type"] == "notice"]
+        self.assertIn("没有找到 Chrome 或 Edge，请先安装其中一个", texts)
+
+    def test_logout_requires_token_and_updates_state(self):
+        self.assertEqual(self.app.state()["account"], "微信")
+        self.assertEqual(self.request("POST", "/api/logout", {}, auth=False)[0].status, 403)
+        self.assertTrue(self.engine.logged_in)
+        self.assertEqual(self.request("POST", "/api/logout", {})[0].status, 200)
+        self.assertEqual(self.engine.calls, [{"logout": True}])
+        state = self.app.state()
+        self.assertFalse(state["login"])
+        self.assertIsNone(state["account"])
+        pushed = [e for e in self.app.events if e["type"] == "state"][-1]
+        self.assertFalse(pushed["login"])  # 已打开的页面要收到更新
+
+    def test_reconnect_does_not_replay_old_state(self):
+        self.app.publish("state", busy=None, login=False, account=None)  # 历史上的旧状态
+        self.app.publish("notice", level="info", text="历史消息")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/api/events?since=0", headers={"Cookie": f"cf_token={TOKEN}"})
+        response = conn.getresponse()
+        seen = []
+        while not any(item.get("text") == "历史消息" for item in seen):
+            line = response.fp.readline().decode("utf-8").strip()
+            if line.startswith("data: "):
+                seen.append(json.loads(line[6:]))
+        conn.close()
+        self.assertTrue(seen[0]["login"])  # 连接时先收到当前状态
+        self.assertEqual([e for e in seen[1:] if e.get("type") == "state"], [])
+
+    def test_logout_blocked_while_running(self):
         self.engine.release.clear()
-        self.engine.qr_png = self.qr_png("http://txz.qq.com/p?k=abc&f=1")
-        self.assertEqual(self.request("GET", "/api/login/link")[0].status, 404)
-        self.request("POST", "/api/login", {})
-        deadline = time.time() + 5
-        while self.app.login_link is None and time.time() < deadline:
-            time.sleep(0.02)
-        self.assertEqual(self.request("GET", "/api/login/link", auth=False)[0].status, 401)
-        response, body = self.request("GET", "/api/login/link")
-        self.assertEqual(response.status, 200)
-        self.assertEqual(response.getheader("Cache-Control"), "no-store")
-        data = json.loads(body)
-        self.assertEqual(data["direct"], "http://txz.qq.com/p?k=abc&f=1")
-        self.assertTrue(data["qq"].startswith("mqqapi://"))
+        self.request("POST", "/api/run", {"urls": [URL_A]})
+        self.assertEqual(self.request("POST", "/api/logout", {})[0].status, 409)
+        self.assertTrue(self.engine.logged_in)
         self.engine.release.set()
         self.wait_idle()
-        self.assertEqual(self.request("GET", "/api/login/link")[0].status, 404)
 
     def test_login_window_option(self):
         self.assertEqual(self.request("POST", "/api/login", {"window": True})[0].status, 200)

@@ -9,29 +9,28 @@
 """
 
 import argparse
-import base64
 import csv
 import hmac
-import io
 import ipaddress
 import json
 import logging
 import secrets
 import socket
+import sys
 import threading
 import time
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import cf_claim
 
-BASE_DIR = Path(__file__).resolve().parent
-WEB_DIR = BASE_DIR / "web"
-TOKEN_FILE = BASE_DIR / "web_token.txt"
-ACTIVITIES_CACHE = BASE_DIR / "activities_cache.json"
+WEB_DIR = cf_claim.BASE_DIR / "web"
+TOKEN_FILE = cf_claim.DATA_DIR / "web_token.txt"
+ACTIVITIES_CACHE = cf_claim.DATA_DIR / "activities_cache.json"
+ACTIVITIES_STALE_SECONDS = 12 * 3600
 DEFAULT_PORT = 8765
 COOKIE_NAME = "cf_token"
 MAX_EVENTS = 5000
@@ -95,36 +94,12 @@ def access_urls(port, token):
     return urls
 
 
-def decode_login_link(png):
-    """读出登录二维码里的链接，只接受腾讯自己的地址。读不出来时返回 None，扫码不受影响。"""
-    try:
-        import zxingcpp
-        from PIL import Image
-
-        results = zxingcpp.read_barcodes(Image.open(io.BytesIO(png)))
-    except Exception:
-        log.warning("读取二维码内容失败")
-        return None
-    for result in results:
-        parts = urlsplit(result.text)
-        host = parts.hostname or ""
-        if parts.scheme in ("http", "https") and (host == "qq.com" or host.endswith(".qq.com")):
-            return result.text
-    return None
-
-
-def qq_open_url(link):
-    """手机 QQ 的跳转地址。这不是公开接口，能否使用取决于 QQ 版本，属于试验功能。"""
-    encoded = base64.b64encode(link.encode("utf-8")).decode("ascii")
-    return f"mqqapi://forward/url?src_type=web&version=1&url_prefix={quote(encoded, safe='')}"
-
-
 class App:
     """保存任务状态和事件流。同一时间只运行一个任务，因为它们共用一份浏览器资料。"""
 
     def __init__(self, engine=cf_claim, config=None):
         self.engine = engine
-        self.config = config if config is not None else engine.load_config(BASE_DIR / "config.json")
+        self.config = config if config is not None else engine.load_config(engine.config_path())
         self.cond = threading.Condition()
         self.events = []
         self.seq = 0
@@ -133,7 +108,6 @@ class App:
         self.stop_flag = threading.Event()
         self.login_invalid = False
         self.login_qr = None
-        self.login_link = None
         self.discovered = self._load_cache()
 
     def _load_cache(self):
@@ -146,8 +120,15 @@ class App:
     def activities(self):
         return self.engine.merge_activities(self.config.get("activities", []), self.discovered)
 
+    def activities_stale(self):
+        try:
+            return time.time() - ACTIVITIES_CACHE.stat().st_mtime > ACTIVITIES_STALE_SECONDS
+        except OSError:
+            return True
+
     def state(self):
-        return {"busy": self.job, "login": self.engine.login_saved() and not self.login_invalid}
+        login = self.engine.login_saved() and not self.login_invalid
+        return {"busy": self.job, "login": login, "account": self.engine.login_account() if login else None}
 
     def publish(self, kind, **fields):
         with self.cond:
@@ -174,9 +155,10 @@ class App:
         def body():
             try:
                 target()
-            except Exception:
+            except Exception as e:
                 log.exception("任务失败: %s", kind)
-                self.publish("notice", level="error", text="任务异常结束，详情见 claim.log")
+                known = isinstance(e, getattr(self.engine, "BrowserNotFound", ()))
+                self.publish("notice", level="error", text=str(e) if known else "任务异常结束，详情见 claim.log")
                 if kind == "run":
                     self.publish("run_done", code=1, stats={}, claimed=0, stopped=False, failed=0, total=0)
             finally:
@@ -204,12 +186,13 @@ class App:
 
         return "ok" if self._start("run", target) else "busy"
 
-    def start_login(self, window=False):
+    def start_login(self, window=False, method="qq"):
         """默认在页面上扫码；window 表示在电脑上打开登录窗口，二维码取不到时备用。"""
+        if method not in self.engine.LOGIN_METHODS:
+            return "invalid"
 
         def set_qr(png):
             self.login_qr = png
-            self.login_link = decode_login_link(png)
 
         def target():
             try:
@@ -221,16 +204,25 @@ class App:
                 else:
                     code = self.engine.cmd_qr_login(
                         self.config, emit=self.publish, on_qr=set_qr, should_stop=self.stop_flag.is_set,
-                        timeout_seconds=LOGIN_TIMEOUT_SECONDS,
+                        timeout_seconds=LOGIN_TIMEOUT_SECONDS, method=method,
                     )
                 if code == 0:
                     self.login_invalid = False
             finally:
-                # 二维码和链接都能登录账号，用完立刻清掉
+                # 二维码能登录账号，用完立刻清掉
                 self.login_qr = None
-                self.login_link = None
 
         return "ok" if self._start("login", target) else "busy"
+
+    def logout(self):
+        with self.cond:
+            if self.job:
+                return "busy"
+        self.engine.logout()
+        self.login_invalid = False
+        self.publish("notice", level="info", text="已退出登录")
+        self.publish("state", **self.state())
+        return "ok"
 
     def start_refresh(self):
         def target():
@@ -308,7 +300,7 @@ def make_handler(app, token, lan):
             elif path == "/api/events":
                 self._stream(parts)
             elif path == "/api/activities":
-                self._json({"activities": app.activities()})
+                self._json({"activities": app.activities(), "stale": app.activities_stale()})
             elif path == "/api/history":
                 self._json({"items": app.history()})
             elif path == "/api/access":
@@ -319,12 +311,6 @@ def make_handler(app, token, lan):
                 qr = app.login_qr
                 if qr:
                     self._send(HTTPStatus.OK, qr, "image/png")
-                else:
-                    self._send(HTTPStatus.NOT_FOUND, b"{}")
-            elif path == "/api/login/link":
-                link = app.login_link
-                if link:
-                    self._json({"qq": qq_open_url(link), "direct": link})
                 else:
                     self._send(HTTPStatus.NOT_FOUND, b"{}")
             else:
@@ -352,7 +338,9 @@ def make_handler(app, token, lan):
                     return
                 self._result(app.start_run(urls, bool(data.get("dry_run")), bool(data.get("show"))))
             elif path == "/api/login":
-                self._result(app.start_login(window=bool(data.get("window"))))
+                self._result(app.start_login(window=bool(data.get("window")), method=data.get("method", "qq")))
+            elif path == "/api/logout":
+                self._result(app.logout())
             elif path == "/api/refresh":
                 self._result(app.start_refresh())
             elif path == "/api/stop":
@@ -398,6 +386,8 @@ def make_handler(app, token, lan):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             try:
+                # 补发历史时跳过旧的状态事件，否则页面会被旧的登录状态覆盖
+                connected_seq = app.seq
                 self.wfile.write(f"event: state\ndata: {json.dumps(app.state(), ensure_ascii=False)}\n\n".encode("utf-8"))
                 self.wfile.flush()
                 while True:
@@ -405,6 +395,9 @@ def make_handler(app, token, lan):
                     if not batch:
                         self.wfile.write(b": keepalive\n\n")
                     for event in batch:
+                        if event["type"] == "state" and event["seq"] <= connected_seq:
+                            since = event["seq"]
+                            continue
                         payload = json.dumps(event, ensure_ascii=False)
                         self.wfile.write(f"id: {event['seq']}\ndata: {payload}\n\n".encode("utf-8"))
                         since = event["seq"]
@@ -418,6 +411,11 @@ def make_handler(app, token, lan):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
+
+    def handle_error(self, request, client_address):
+        # 手机锁屏或切走时连接会直接断开，这是正常情况
+        if not isinstance(sys.exc_info()[1], ConnectionError):
+            super().handle_error(request, client_address)
 
 
 def create_server(lan=True, port=DEFAULT_PORT, app=None):

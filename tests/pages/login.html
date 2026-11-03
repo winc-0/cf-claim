@@ -3,6 +3,11 @@
 <title>mock login</title>
 <style>#box{display:none} #qrlogin_img{width:90px;height:90px;display:block} #qr_invalid,#qrlogin_step2{display:none}</style>
 <a id="dologin" href="javascript:;" onclick="start()">登录</a>
+<a class="wx-tab" href="javascript:;" onclick="startWx()" style="display:none">微信账号登录</a>
+<img class="js_qrcode_img" style="display:none" alt="">
+<img class="js_qrcode_img wx-real" style="display:none;width:90px;height:90px;background:#222" alt="">
+<div class="js_wx_after_scan" style="display:none">扫描成功</div>
+<div class="js_wx_after_cancel" style="display:none">已取消</div>
 <div id="box">
   <div id="qrlogin_img"></div>
   <div id="qr_invalid">已过期</div>
@@ -10,7 +15,23 @@
 </div>
 <script>
   function setCookie(name) { document.cookie = name + '=x; path=/; domain=.qq.com'; }
+  function startWx() {
+    document.getElementById('box').style.display = 'none';
+    const img = document.querySelector('.wx-real');
+    img.style.display = 'block';
+    const runs = Number(sessionStorage.getItem('wxOpens') || 0) + 1;
+    sessionStorage.setItem('wxOpens', runs);
+    if (window.__MODE === 'wx-cancel' && runs === 1) {
+      setTimeout(() => { document.querySelector('.js_wx_after_cancel').style.display = 'block'; }, 400);
+      return;
+    }
+    setTimeout(() => { document.querySelector('.js_wx_after_scan').style.display = 'block'; }, 600);
+    // 微信登录没有 QQ 的基础 Cookie
+    setTimeout(() => { setCookie('acctype'); setCookie('openid'); setCookie('access_token'); }, 1200);
+  }
   function start() {
+    document.querySelector('.wx-tab').style.display = 'block';
+    if ((window.__MODE || '').startsWith('wx')) return;  // 微信流程等点切换入口
     document.getElementById('box').style.display = 'block';
     const img = document.getElementById('qrlogin_img');
     img.style.background = '#111';
